@@ -285,10 +285,17 @@ addr_line_by_norm() {
 }
 
 rand16_hex() {
+  local val=""
   if have od; then
-    od -An -N2 -tx2 /dev/urandom | tr -d ' \n'
+    val="$(od -An -N2 -tx2 /dev/urandom 2>/dev/null | tr -d ' \n\r')"
+  elif have hexdump; then
+    val="$(hexdump -n 2 -e '1/2 "%04x"' /dev/urandom 2>/dev/null)"
+  fi
+
+  if [ -z "$val" ]; then
+    printf "%04x" "$RANDOM"
   else
-    hexdump -n 2 -e '1/2 "%04x"' /dev/urandom
+    echo "$val" | tr -cd '0-9a-fA-F' | cut -c1-4
   fi
 }
 
@@ -316,6 +323,7 @@ gen_one_ip() {
     fi
   done
   for ((i=0;i<8;i++)); do printf "%x" "${OUT[i]}"; ((i<7)) && printf ":"; done
+  return 0
 }
 
 # -------------------- 生成 5 个地址 --------------------
@@ -362,6 +370,11 @@ log "✅ 添加方式：/$ASSIGN_PFXLEN ${ASSIGN_OPTS:-"(no extra opts)"}"
 # -------------------- 写 unit 并启动 --------------------
 systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true
 
+IP_BIN="$(command -v ip 2>/dev/null || true)"
+[ -n "$IP_BIN" ] || IP_BIN="/usr/sbin/ip"
+[ -x "$IP_BIN" ] || IP_BIN="/sbin/ip"
+[ -x "$IP_BIN" ] || die "找不到 ip 命令（iproute2）"
+
 cat > "$UNIT" <<EOF
 [Unit]
 Description=Add 5 Static IPv6 Addresses (generated once, persistent)
@@ -371,23 +384,27 @@ After=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'IPBIN=\$(command -v ip 2>/dev/null || true); [ -n "\$IPBIN" ] || IPBIN=/usr/sbin/ip; [ -x "\$IPBIN" ] || IPBIN=/sbin/ip; \
-getiface() { \
-IFACE=\$("\$IPBIN" -6 route show default 2>/dev/null | awk "NR==1{for(i=1;i<=NF;i++) if(\\\$i==\\"dev\\"){print \\\$(i+1); exit}}"); \
-[ -n "\$IFACE" ] || IFACE=\$("\$IPBIN" -6 route get 2001:4860:4860::8888 2>/dev/null | awk "{for(i=1;i<=NF;i++) if(\\\$i==\\"dev\\"){print \\\$(i+1); exit}}"); \
-echo "\$IFACE"; \
-}; \
-IFACE="\$(getiface)"; \
-tries=0; \
-while [ -z "\$IFACE" ] && [ "\$tries" -lt 30 ]; do sleep 2; IFACE="\$(getiface)"; tries=\$((tries+1)); done; \
-[ -n "\$IFACE" ] || { echo "ipv6-static: cannot detect IPv6 default-route interface" >&2; exit 1; }; \
-while read -r ip6; do [ -n "\$ip6" ] || continue; "\$IPBIN" -6 addr add "\$ip6/$ASSIGN_PFXLEN" dev "\$IFACE" $ASSIGN_OPTS 2>/dev/null || true; done < $LIST'
+EOF
 
-ExecStop=/bin/sh -c 'IPBIN=\$(command -v ip 2>/dev/null || true); [ -n "\$IPBIN" ] || IPBIN=/usr/sbin/ip; [ -x "\$IPBIN" ] || IPBIN=/sbin/ip; \
-IFACE=\$("\$IPBIN" -6 route show default 2>/dev/null | awk "NR==1{for(i=1;i<=NF;i++) if(\\\$i==\\"dev\\"){print \\\$(i+1); exit}}"); \
-[ -n "\$IFACE" ] || IFACE=\$("\$IPBIN" -6 route get 2001:4860:4860::8888 2>/dev/null | awk "{for(i=1;i<=NF;i++) if(\\\$i==\\"dev\\"){print \\\$(i+1); exit}}"); \
-[ -n "\$IFACE" ] || exit 0; \
-while read -r ip6; do [ -n "\$ip6" ] || continue; "\$IPBIN" -6 addr del "\$ip6/$ASSIGN_PFXLEN" dev "\$IFACE" $ASSIGN_OPTS 2>/dev/null || true; done < $LIST'
+while read -r ip6; do
+  [ -n "$ip6" ] || continue
+  if [ -n "$ASSIGN_OPTS" ]; then
+    echo "ExecStart=-$IP_BIN -6 addr add $ip6/$ASSIGN_PFXLEN dev $IFACE $ASSIGN_OPTS" >> "$UNIT"
+  else
+    echo "ExecStart=-$IP_BIN -6 addr add $ip6/$ASSIGN_PFXLEN dev $IFACE" >> "$UNIT"
+  fi
+done < "$LIST"
+
+while read -r ip6; do
+  [ -n "$ip6" ] || continue
+  if [ -n "$ASSIGN_OPTS" ]; then
+    echo "ExecStop=-$IP_BIN -6 addr del $ip6/$ASSIGN_PFXLEN dev $IFACE $ASSIGN_OPTS" >> "$UNIT"
+  else
+    echo "ExecStop=-$IP_BIN -6 addr del $ip6/$ASSIGN_PFXLEN dev $IFACE" >> "$UNIT"
+  fi
+done < "$LIST"
+
+cat >> "$UNIT" <<EOF
 
 [Install]
 WantedBy=multi-user.target
