@@ -28,7 +28,7 @@ nano /etc/sing-box/config.json
       "tag": "ss-in",
       "listen": "::",
       "listen_port": 8085,
-      "network": ["tcp","udp"]
+      "network": ["tcp","udp"],
       "tcp_fast_open": true,
       "method": "2022-blake3-aes-256-gcm",
       "password": "这里填你生成的32位Base64密钥"

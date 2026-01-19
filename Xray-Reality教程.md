@@ -228,7 +228,7 @@ systemctl restart xray
 然后就可以使用了
 
 ```
-vless://【你的UUID】@【服务器地址】:【端口】?flow=xtls-rprx-vision&security=reality&sni=【你的SNI】&fp=chrome&pbk=【你的公钥Public key/Password】&sid=【你的ShortID】&type=tcp#【节点名称】
+vless://【你的UUID】@【服务器地址】:【端口】?flow=xtls-rprx-vision&security=reality&sni=【你的SNI】&fp=chrome&pbk=【你的公钥Public key/Password】&sid=【你的ShortID】&type=tcp&packet-encoding=xudp#【节点名称】
 ```
 
 ```
