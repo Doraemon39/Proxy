@@ -363,9 +363,15 @@ After=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/bin/sh -c 'IPBIN=\$(command -v ip 2>/dev/null || true); [ -n "\$IPBIN" ] || IPBIN=/usr/sbin/ip; [ -x "\$IPBIN" ] || IPBIN=/sbin/ip; \
+getiface() { \
 IFACE=\$("\$IPBIN" -6 route show default 2>/dev/null | awk "NR==1{for(i=1;i<=NF;i++) if(\\\$i==\\"dev\\"){print \\\$(i+1); exit}}"); \
 [ -n "\$IFACE" ] || IFACE=\$("\$IPBIN" -6 route get 2001:4860:4860::8888 2>/dev/null | awk "{for(i=1;i<=NF;i++) if(\\\$i==\\"dev\\"){print \\\$(i+1); exit}}"); \
-[ -n "\$IFACE" ] || exit 0; \
+echo "\$IFACE"; \
+}; \
+IFACE="\$(getiface)"; \
+tries=0; \
+while [ -z "\$IFACE" ] && [ "\$tries" -lt 30 ]; do sleep 2; IFACE="\$(getiface)"; tries=\$((tries+1)); done; \
+[ -n "\$IFACE" ] || { echo "ipv6-static: cannot detect IPv6 default-route interface" >&2; exit 1; }; \
 while read -r ip6; do [ -n "\$ip6" ] || continue; "\$IPBIN" -6 addr add "\$ip6/$ASSIGN_PFXLEN" dev "\$IFACE" $ASSIGN_OPTS 2>/dev/null || true; done < $LIST'
 
 ExecStop=/bin/sh -c 'IPBIN=\$(command -v ip 2>/dev/null || true); [ -n "\$IPBIN" ] || IPBIN=/usr/sbin/ip; [ -x "\$IPBIN" ] || IPBIN=/sbin/ip; \
