@@ -258,12 +258,15 @@ expand_ipv6() {
   fi
   for ((i=0;i<8;i++)); do
     local h="${FULL[i]:-0}"
+    if ! [[ "$h" =~ ^[0-9A-Fa-f]{1,4}$ ]]; then
+      return 1
+    fi
     printf "%04x" "$((16#$h))"
     ((i<7)) && printf ":"
   done
 }
 
-norm6() { expand_ipv6 "$1" | tr -d ':'; }
+norm6() { expand_ipv6 "$1" 2>/dev/null | tr -d ':' || true; }
 
 addr_line_by_norm() {
   local cand="$1"
@@ -289,8 +292,10 @@ rand16_hex() {
   fi
 }
 
-BASE_EXP="$(expand_ipv6 "$BASE_IP")"
-IFS=':' read -r -a BASE_ARR <<< "$BASE_EXP"
+BASE_EXP="$(expand_ipv6 "$BASE_IP" || true)"
+[ -n "$BASE_EXP" ] || die "IPv6 展开失败：$BASE_IP（可能包含无效字符）"
+IFS=':' read -r -a BASE_ARR <<< "$BASE_EXP" || true
+[ "${#BASE_ARR[@]}" -eq 8 ] || die "IPv6 展开结果异常：$BASE_IP -> $BASE_EXP"
 
 gen_one_ip() {
   local plen="$GEN_PFXLEN"
@@ -319,8 +324,12 @@ ROLLBACK_NEEDED=1
 chmod 600 "$LIST" || true
 count=0
 while [ "$count" -lt 5 ]; do
-  ip6="$(gen_one_ip)"
-  grep -qx "$ip6" "$LIST" 2>/dev/null && continue
+  if ! ip6="$(gen_one_ip)"; then
+    die "生成 IPv6 失败（随机数或前缀解析异常）"
+  fi
+  if grep -qx "$ip6" "$LIST" 2>/dev/null; then
+    continue
+  fi
   echo "$ip6" >> "$LIST"
   count=$((count+1))
 done
