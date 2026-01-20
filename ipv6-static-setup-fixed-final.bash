@@ -568,11 +568,15 @@ add_ips() {
 
 add_ips
 while true; do
-  while IFS= read -r _line; do
+  (\$IP_CMD -6 monitor address dev "\$IFACE" 2>/dev/null || true) |
+  while read -r _line; do
     case "\${_line}" in
-      *Deleted*|*RTM_DELADDR* ) add_ips ;;
+      *Deleted*|*RTM_DELADDR* )
+        add_ips
+        sleep 2
+        ;;
     esac
-  done < <(\$IP_CMD -6 monitor address dev "\$IFACE" 2>/dev/null || true)
+  done
   sleep 2
 done
 EOF
@@ -583,6 +587,7 @@ cat > "$MONITOR_UNIT" <<EOF
 Description=IPv6 Static Address Monitor (event-driven)
 Wants=network-online.target
 After=network-online.target
+After=$SERVICE
 PartOf=$SERVICE
 ConditionPathExists=/sys/class/net/$IFACE
 
@@ -633,6 +638,7 @@ route_check() { ip -6 route get 2606:4700:4700::1111 from "$1" >/dev/null 2>&1; 
 ping_check() { have ping && ping -6 -c 2 -I "$1" 2606:4700:4700::1111 >/dev/null 2>&1; }
 
 log "🔎 安全校验：DAD + route-get..."
+route_check_warned=0
 while read -r ip6; do
   [ -n "$ip6" ] || continue
   wait_dad_ok "$ip6" || {
@@ -644,9 +650,16 @@ while read -r ip6; do
       *) die "DAD 失败：$ip6（未知原因）" ;;
     esac
   }
-  route_check "$ip6" || die "route-get 失败：源地址 $ip6 无法选择有效路由"
+  if ! route_check "$ip6"; then
+    warn "route-get 失败：源地址 $ip6 无法选择有效路由（仅警告，未回滚）"
+    route_check_warned=1
+  fi
 done < "$LIST"
-log "✅ DAD + route-get 通过"
+if [ "$route_check_warned" -eq 0 ]; then
+  log "✅ DAD + route-get 通过"
+else
+  warn "route-get 存在失败（可能网络阻断或无公网路由），已保留地址"
+fi
 
 log "🔎 可选校验：最小 ICMP 出站（失败可能是 ICMP 被挡）"
 while read -r ip6; do
