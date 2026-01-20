@@ -10,30 +10,34 @@
 
 1. **创建脚本文件**
 
-   ```
+   ```bash
    nano ipv6-static-setup-fixed-final.bash
    ```
 
-   ```
-   将 ipv6-static-setup-fixed-final.bash 复制进去
+   ```bash
+   # 将 ipv6-static-setup-fixed-final.bash 复制进去
    ```
 
    按 `Ctrl+O` 保存，再按 `Ctrl+X` 退出。
 
 2. **赋予权限并执行**
 
-   ```
+   ```bash
    chmod +x ipv6-static-setup-fixed-final.bash
    bash ./ipv6-static-setup-fixed-final.bash
    ```
 
 3. **查看生成的地址** 执行成功后，系统会自动配置好开机自启。你可以查看生成的 5 个地址：
 
-   ```
+   ```bash
    cat ~/random-ipv6
    ```
 
+4. **清理残留文件**
 
+   ```bash
+   rm ./ipv6-static-setup-fixed-final.bash
+   ```
 
 #### 第二步：配置 Xray-core 出站 (Outbounds)
 
