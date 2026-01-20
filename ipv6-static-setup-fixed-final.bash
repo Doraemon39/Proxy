@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+umask 077
+
 SERVICE="ipv6-static.service"
 UNIT="/etc/systemd/system/${SERVICE}"
 LIST="/etc/ipv6-static.list"
@@ -186,7 +188,11 @@ if [ -f "$BACKUP_DIR/latest" ]; then
   PREV_LATEST="$(cat "$BACKUP_DIR/latest" 2>/dev/null || true)"
 fi
 
-TS="$(date +%Y%m%d_%H%M%S 2>/dev/null || echo "unknown_time")"
+TS_BASE="$(date +%Y%m%d_%H%M%S 2>/dev/null || echo "unknown_time")"
+TS_NS="$(date +%N 2>/dev/null || true)"
+case "$TS_NS" in (""|*[!0-9]*) TS_NS="$RANDOM" ;; esac
+TS_RAND="$(printf %04x "$RANDOM")"
+TS="${TS_BASE}_${TS_NS}_${TS_RAND}"
 BK="$BACKUP_DIR/$TS"
 mkdir -p "$BK"
 printf '%s' "$TS" > "$BACKUP_DIR/latest"
@@ -384,6 +390,20 @@ gen_one_ip() {
   return 0
 }
 
+pick_probe_ip() {
+  local i ip6
+  for i in $(seq 1 40); do
+    ip6="$(gen_one_ip)" || continue
+    [ -n "${ip6:-}" ] || continue
+    grep -qx "$ip6" "$LIST" 2>/dev/null && continue
+    if addr_line_by_norm "$ip6" >/dev/null 2>&1; then
+      continue
+    fi
+    echo "$ip6"; return 0
+  done
+  return 1
+}
+
 # -------------------- 生成 5 个地址（优先读取旧列表） --------------------
 ROLLBACK_NEEDED=1
 existing_ips=()
@@ -524,6 +544,8 @@ EOF
 cat > "$MONITOR_SCRIPT" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+
+umask 077
 IP_CMD="$IP_BIN"
 IFACE="$IFACE"
 ASSIGN_PFXLEN="$ASSIGN_PFXLEN"
@@ -546,12 +568,12 @@ add_ips() {
 
 add_ips
 while true; do
-  if (set +o pipefail; \$IP_CMD -6 monitor address dev "\$IFACE" 2>/dev/null | grep -m 1 -qi "Deleted"); then
-    add_ips
-    sleep 1
-  else
-    sleep 1
-  fi
+  while IFS= read -r _line; do
+    case "\${_line}" in
+      *Deleted*|*RTM_DELADDR* ) add_ips ;;
+    esac
+  done < <(\$IP_CMD -6 monitor address dev "\$IFACE" 2>/dev/null || true)
+  sleep 2
 done
 EOF
 chmod +x "$MONITOR_SCRIPT"
@@ -666,6 +688,8 @@ cat > "$RESTORE_BIN" <<'EOS'
 #!/usr/bin/env bash
 set -euo pipefail
 
+umask 077
+
 SERVICE="ipv6-static.service"
 UNIT="/etc/systemd/system/${SERVICE}"
 LIST="/etc/ipv6-static.list"
@@ -705,14 +729,20 @@ read_meta() {
   BK=""
   HOME_LIST_PREEXISTED=0
   if [ -f "$META" ]; then
-    # shellcheck disable=SC1090
-    source <(sed 's/^\([^=]*\)=/export \1=/' "$META" 2>/dev/null || true)
-    [ -n "${assign_prefixlen:-}" ] && ASSIGN_PFXLEN="$assign_prefixlen"
-    [ -n "${assign_opts:-}" ] && ASSIGN_OPTS="$assign_opts"
-    [ -n "${home_list_path:-}" ] && HOME_LIST_PATH="$home_list_path"
-    [ -n "${backup_dir:-}" ] && BK="$backup_dir"
-    [ -n "${home_list_preexisted:-}" ] && HOME_LIST_PREEXISTED="$home_list_preexisted"
+    while IFS='=' read -r k v; do
+      [ -n "${k:-}" ] || continue
+      k="${k%%[[:space:]]*}"
+      case "$k" in
+        assign_prefixlen) ASSIGN_PFXLEN="$v" ;;
+        assign_opts) ASSIGN_OPTS="$v" ;;
+        home_list_path) HOME_LIST_PATH="$v" ;;
+        backup_dir) BK="$v" ;;
+        home_list_preexisted) HOME_LIST_PREEXISTED="$v" ;;
+      esac
+    done < "$META"
   fi
+  case "$ASSIGN_PFXLEN" in (''|*[!0-9]*) ASSIGN_PFXLEN="128" ;; esac
+  case "$HOME_LIST_PREEXISTED" in (''|*[!0-9]*) HOME_LIST_PREEXISTED=0 ;; esac
 }
 
 remove_ips() {
