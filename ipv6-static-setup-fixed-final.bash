@@ -34,9 +34,15 @@ if ! have od && ! have hexdump; then
 fi
 
 # ---------- 目标 home：尽量写到原始 sudo 用户家目录，而不是 /root ----------
-TARGET_HOME="$HOME"
+TARGET_HOME="${HOME:-/root}"
 if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
-  TH="$(eval echo "~$SUDO_USER" 2>/dev/null || true)"
+  TH=""
+  if have getent; then
+    TH="$(getent passwd "$SUDO_USER" 2>/dev/null | awk -F: '{print $6; exit}')"
+  fi
+  if [ -z "${TH:-}" ]; then
+    TH="$(eval echo "~$SUDO_USER" 2>/dev/null || true)"
+  fi
   [ -d "${TH:-}" ] && TARGET_HOME="$TH"
 fi
 HOME_LIST="$TARGET_HOME/random-ipv6"
@@ -227,7 +233,7 @@ detect_iface() {
   [ -n "${iface:-}" ] && { echo "$iface"; return 0; }
   while read -r dev; do
     [ "$dev" = "lo" ] && continue
-    ip -6 -o addr show dev "$dev" scope global 2>/dev/null | awk 'NR==1{exit 0} END{exit 1}' && { echo "$dev"; return 0; }
+    ip -6 -o addr show dev "$dev" scope global 2>/dev/null | awk 'NR==1{found=1; exit} END{exit !found}' && { echo "$dev"; return 0; }
   done < <(ip -o link show up 2>/dev/null | awk -F': ' '{split($2,a,"@"); print a[1]}')
   return 1
 }
@@ -392,7 +398,7 @@ gen_one_ip() {
 
 pick_probe_ip() {
   local i ip6
-  for i in $(seq 1 40); do
+  for ((i=1; i<=40; i++)); do
     ip6="$(gen_one_ip)" || continue
     [ -n "${ip6:-}" ] || continue
     grep -qx "$ip6" "$LIST" 2>/dev/null && continue
@@ -459,7 +465,11 @@ done
 # -------------------- 选择添加方式（回退） --------------------
 try_add_del() {
   local ip6="$1" pfx="$2"; shift 2
-  local -a opts=( "$@" )
+  local -a opts=()
+  local _opt
+  for _opt in "$@"; do
+    [ -n "${_opt}" ] && opts+=("${_opt}")
+  done
   if ip -6 addr add "$ip6/$pfx" dev "$IFACE" "${opts[@]}" 2>/dev/null; then
     ip -6 addr del "$ip6/$pfx" dev "$IFACE" "${opts[@]}" 2>/dev/null || true
     return 0
@@ -484,9 +494,9 @@ if addr_line_by_norm "$probe_ip" >/dev/null 2>&1; then
 fi
 if try_add_del "$probe_ip" 128 "noprefixroute"; then
   ASSIGN_PFXLEN=128; ASSIGN_OPTS="noprefixroute"
-elif try_add_del "$probe_ip" 128 ""; then
+elif try_add_del "$probe_ip" 128; then
   ASSIGN_PFXLEN=128; ASSIGN_OPTS=""
-elif try_add_del "$probe_ip" "$GEN_PFXLEN" ""; then
+elif try_add_del "$probe_ip" "$GEN_PFXLEN"; then
   ASSIGN_PFXLEN="$GEN_PFXLEN"; ASSIGN_OPTS=""
 elif try_add_del "$probe_ip" "$GEN_PFXLEN" "noprefixroute"; then
   ASSIGN_PFXLEN="$GEN_PFXLEN"; ASSIGN_OPTS="noprefixroute"
@@ -511,6 +521,7 @@ cat > "$UNIT" <<EOF
 Description=Add 5 Static IPv6 Addresses (generated once, persistent)
 Wants=network-online.target
 After=network-online.target
+ConditionPathExists=/sys/class/net/$IFACE
 
 [Service]
 Type=oneshot
@@ -730,7 +741,7 @@ detect_iface() {
   [ -n "${iface:-}" ] && { echo "$iface"; return 0; }
   while read -r dev; do
     [ "$dev" = "lo" ] && continue
-    ip -6 -o addr show dev "$dev" scope global 2>/dev/null | awk 'NR==1{exit 0} END{exit 1}' && { echo "$dev"; return 0; }
+    ip -6 -o addr show dev "$dev" scope global 2>/dev/null | awk 'NR==1{found=1; exit} END{exit !found}' && { echo "$dev"; return 0; }
   done < <(ip -o link show up 2>/dev/null | awk -F': ' '{split($2,a,"@"); print a[1]}')
   return 1
 }
