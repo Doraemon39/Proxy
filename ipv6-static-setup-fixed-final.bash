@@ -287,22 +287,23 @@ addr_line_by_norm() {
 rand16_hex() {
   local val=""
   if have od; then
-    val="$(od -An -N2 -tx2 /dev/urandom 2>/dev/null | tr -d ' \n\r')"
+    val="$(od -An -N2 -tx2 /dev/urandom 2>/dev/null | tr -d ' \n\r' || true)"
   elif have hexdump; then
-    val="$(hexdump -n 2 -e '1/2 "%04x"' /dev/urandom 2>/dev/null)"
+    val="$(hexdump -n 2 -e '1/2 "%04x"' /dev/urandom 2>/dev/null || true)"
   fi
 
+  val="$(printf '%s' "$val" | tr -cd '0-9a-fA-F' | cut -c1-4)"
   if [ -z "$val" ]; then
     printf "%04x" "$RANDOM"
   else
-    echo "$val" | tr -cd '0-9a-fA-F' | cut -c1-4
+    printf '%s' "$val"
   fi
 }
 
 BASE_EXP="$(expand_ipv6 "$BASE_IP" || true)"
-[ -n "$BASE_EXP" ] || die "IPv6 展开失败：$BASE_IP（可能包含无效字符）"
+[ -n "$BASE_EXP" ] || die "IPv6 expansion failed: BASE_IP may contain invalid characters"
 IFS=':' read -r -a BASE_ARR <<< "$BASE_EXP" || true
-[ "${#BASE_ARR[@]}" -eq 8 ] || die "IPv6 展开结果异常：$BASE_IP -> $BASE_EXP"
+[ "${#BASE_ARR[@]}" -eq 8 ] || die "IPv6 expansion unexpected: BASE_IP -> $BASE_EXP"
 
 gen_one_ip() {
   local plen="$GEN_PFXLEN"
@@ -333,8 +334,9 @@ chmod 600 "$LIST" || true
 count=0
 while [ "$count" -lt 5 ]; do
   if ! ip6="$(gen_one_ip)"; then
-    die "生成 IPv6 失败（随机数或前缀解析异常）"
+    die "IPv6 generation failed (random or prefix parsing issue)"
   fi
+  [ -n "$ip6" ] || die "IPv6 generation failed (empty result)"
   if grep -qx "$ip6" "$LIST" 2>/dev/null; then
     continue
   fi
@@ -373,7 +375,7 @@ systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true
 IP_BIN="$(command -v ip 2>/dev/null || true)"
 [ -n "$IP_BIN" ] || IP_BIN="/usr/sbin/ip"
 [ -x "$IP_BIN" ] || IP_BIN="/sbin/ip"
-[ -x "$IP_BIN" ] || die "找不到 ip 命令（iproute2）"
+[ -x "$IP_BIN" ] || die "ip command not found (iproute2)"
 
 cat > "$UNIT" <<EOF
 [Unit]
@@ -389,18 +391,18 @@ EOF
 while read -r ip6; do
   [ -n "$ip6" ] || continue
   if [ -n "$ASSIGN_OPTS" ]; then
-    echo "ExecStart=-$IP_BIN -6 addr add $ip6/$ASSIGN_PFXLEN dev $IFACE $ASSIGN_OPTS" >> "$UNIT"
+    printf 'ExecStart=-%s -6 addr add %s/%s dev %s %s\n' "$IP_BIN" "$ip6" "$ASSIGN_PFXLEN" "$IFACE" "$ASSIGN_OPTS" >> "$UNIT"
   else
-    echo "ExecStart=-$IP_BIN -6 addr add $ip6/$ASSIGN_PFXLEN dev $IFACE" >> "$UNIT"
+    printf 'ExecStart=-%s -6 addr add %s/%s dev %s\n' "$IP_BIN" "$ip6" "$ASSIGN_PFXLEN" "$IFACE" >> "$UNIT"
   fi
 done < "$LIST"
 
 while read -r ip6; do
   [ -n "$ip6" ] || continue
   if [ -n "$ASSIGN_OPTS" ]; then
-    echo "ExecStop=-$IP_BIN -6 addr del $ip6/$ASSIGN_PFXLEN dev $IFACE $ASSIGN_OPTS" >> "$UNIT"
+    printf 'ExecStop=-%s -6 addr del %s/%s dev %s %s\n' "$IP_BIN" "$ip6" "$ASSIGN_PFXLEN" "$IFACE" "$ASSIGN_OPTS" >> "$UNIT"
   else
-    echo "ExecStop=-$IP_BIN -6 addr del $ip6/$ASSIGN_PFXLEN dev $IFACE" >> "$UNIT"
+    printf 'ExecStop=-%s -6 addr del %s/%s dev %s\n' "$IP_BIN" "$ip6" "$ASSIGN_PFXLEN" "$IFACE" >> "$UNIT"
   fi
 done < "$LIST"
 
