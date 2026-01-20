@@ -34,15 +34,9 @@ if ! have od && ! have hexdump; then
 fi
 
 # ---------- 目标 home：尽量写到原始 sudo 用户家目录，而不是 /root ----------
-TARGET_HOME="${HOME:-/root}"
+TARGET_HOME="$HOME"
 if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
-  TH=""
-  if have getent; then
-    TH="$(getent passwd "$SUDO_USER" 2>/dev/null | awk -F: '{print $6; exit}')"
-  fi
-  if [ -z "${TH:-}" ]; then
-    TH="$(eval echo "~$SUDO_USER" 2>/dev/null || true)"
-  fi
+  TH="$(eval echo "~$SUDO_USER" 2>/dev/null || true)"
   [ -d "${TH:-}" ] && TARGET_HOME="$TH"
 fi
 HOME_LIST="$TARGET_HOME/random-ipv6"
@@ -521,7 +515,6 @@ cat > "$UNIT" <<EOF
 Description=Add 5 Static IPv6 Addresses (generated once, persistent)
 Wants=network-online.target
 After=network-online.target
-ConditionPathExists=/sys/class/net/$IFACE
 
 [Service]
 Type=oneshot
@@ -556,38 +549,106 @@ cat > "$MONITOR_SCRIPT" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
-umask 077
+# === 运行时注入的常量 ===
 IP_CMD="$IP_BIN"
 IFACE="$IFACE"
 ASSIGN_PFXLEN="$ASSIGN_PFXLEN"
 ASSIGN_OPTS="$ASSIGN_OPTS"
 LIST_PATH="$LIST"
 
-add_ips() {
-  [ -f "$LIST_PATH" ] || return 0
+# === 轻量锁 + 脏标记（去抖） ===
+LOCK_FILE="/run/ipv6-static-monitor.lock"
+LOCK_DIR="/run/ipv6-static-monitor.lockdir"
+DIRTY_FILE="/run/ipv6-static-monitor.dirty"
+HAVE_FLOCK=1
+if ! command -v flock >/dev/null 2>&1; then
+  HAVE_FLOCK=0
+fi
+
+do_add_ips() {
+  [ -f "\$LIST_PATH" ] || return 0
   while IFS= read -r line; do
     line="\${line%%#*}"
     line="\${line%%[[:space:]]*}"
     [ -n "\$line" ] || continue
+    
     if [ -n "\$ASSIGN_OPTS" ]; then
-      \$IP_CMD -6 addr add "\$line/\$ASSIGN_PFXLEN" dev "\$IFACE" \$ASSIGN_OPTS 2>/dev/null || true
+      "\$IP_CMD" -6 addr add "\$line/\$ASSIGN_PFXLEN" dev "\$IFACE" \$ASSIGN_OPTS 2>/dev/null || true
     else
-      \$IP_CMD -6 addr add "\$line/\$ASSIGN_PFXLEN" dev "\$IFACE" 2>/dev/null || true
+      "\$IP_CMD" -6 addr add "\$line/\$ASSIGN_PFXLEN" dev "\$IFACE" 2>/dev/null || true
     fi
   done < "\$LIST_PATH"
 }
 
-add_ips
+do_sync_body() {
+  rm -f "\$DIRTY_FILE"
+  while true; do
+    do_add_ips
+    if [ -f "\$DIRTY_FILE" ]; then
+      rm -f "\$DIRTY_FILE"
+      sleep 1
+    else
+      break
+    fi
+  done
+}
+
+run_sync() {
+  if [ "\$HAVE_FLOCK" -eq 1 ]; then
+    (
+      # 已有实例持锁时，标记脏后交给持锁方再次补齐
+      flock -n 9 || { touch "\$DIRTY_FILE"; exit 0; }
+
+      # 进入临界区后先清理脏标记
+      do_sync_body
+    ) 9>"\$LOCK_FILE"
+    return 0
+  fi
+
+  # 无 flock 时的简单 lockdir 回退，带轻量 stale 处理
+  local pidfile="\$LOCK_DIR/pid"
+  if mkdir "\$LOCK_DIR" 2>/dev/null; then
+    echo "\$\$" > "\$pidfile" 2>/dev/null || true
+    do_sync_body
+    rm -rf "\$LOCK_DIR" 2>/dev/null || true
+    return 0
+  fi
+
+  if [ -f "\$pidfile" ]; then
+    local opid
+    opid="\$(cat "\$pidfile" 2>/dev/null || true)"
+    if [ -n "\$opid" ] && kill -0 "\$opid" 2>/dev/null; then
+      touch "\$DIRTY_FILE"
+      return 0
+    fi
+  fi
+
+  rm -rf "\$LOCK_DIR" 2>/dev/null || true
+  if mkdir "\$LOCK_DIR" 2>/dev/null; then
+    echo "\$\$" > "\$pidfile" 2>/dev/null || true
+    do_sync_body
+    rm -rf "\$LOCK_DIR" 2>/dev/null || true
+  else
+    touch "\$DIRTY_FILE"
+  fi
+}
+
+trigger_sync() {
+  ( sleep 1; run_sync ) >/dev/null 2>&1 &
+}
+
+# 启动后先补齐一次
+trigger_sync
+
 while true; do
-  (\$IP_CMD -6 monitor address dev "\$IFACE" 2>/dev/null || true) |
-  while read -r _line; do
+  ("\$IP_CMD" -6 monitor address dev "\$IFACE" 2>/dev/null || true) | while read -r _line; do
     case "\${_line}" in
       *Deleted*|*RTM_DELADDR* )
-        add_ips
-        sleep 2
+        trigger_sync
         ;;
     esac
   done
+  
   sleep 2
 done
 EOF
@@ -752,6 +813,7 @@ read_meta() {
   HOME_LIST_PATH=""
   BK=""
   HOME_LIST_PREEXISTED=0
+  IFACE_META=""
   if [ -f "$META" ]; then
     while IFS='=' read -r k v; do
       [ -n "${k:-}" ] || continue
@@ -762,6 +824,7 @@ read_meta() {
         home_list_path) HOME_LIST_PATH="$v" ;;
         backup_dir) BK="$v" ;;
         home_list_preexisted) HOME_LIST_PREEXISTED="$v" ;;
+        iface_detected) IFACE_META="$v" ;;
       esac
     done < "$META"
   fi
@@ -772,7 +835,6 @@ read_meta() {
 remove_ips() {
   local iface="$1"
   [ -f "$LIST" ] || return 0
-  read_meta
   while read -r ip6; do
     [ -n "$ip6" ] || continue
     ip -6 addr del "$ip6/$ASSIGN_PFXLEN" dev "$iface" $ASSIGN_OPTS 2>/dev/null || true
@@ -782,16 +844,16 @@ remove_ips() {
 }
 
 do_uninstall_clean() {
-  local iface=""
-  iface="$(detect_iface || true)"
+  read_meta
+
+  local iface="$IFACE_META"
+  [ -n "${iface:-}" ] || iface="$(detect_iface || true)"
 
   systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true
   systemctl disable --now "$MONITOR_SERVICE" >/dev/null 2>&1 || true
   systemctl disable --now "$LEGACY_APPLY_TIMER" >/dev/null 2>&1 || true
   systemctl disable --now "$LEGACY_APPLY_SERVICE" >/dev/null 2>&1 || true
   [ -n "${iface:-}" ] && remove_ips "$iface"
-
-  read_meta
 
   # 处理 home 文件：原本存在则恢复；否则删除
   if [ -n "${HOME_LIST_PATH:-}" ]; then
@@ -820,8 +882,10 @@ do_restore_previous() {
   local bk="$BACKUP_DIR/$latest"
   [ -d "$bk" ] || { log "⚠️ 备份目录不存在，无法 restore，改为 uninstall。"; do_uninstall_clean; return 0; }
 
-  local iface=""
-  iface="$(detect_iface || true)"
+  read_meta
+
+  local iface="$IFACE_META"
+  [ -n "${iface:-}" ] || iface="$(detect_iface || true)"
 
   systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true
   systemctl disable --now "$MONITOR_SERVICE" >/dev/null 2>&1 || true
