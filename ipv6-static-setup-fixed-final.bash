@@ -7,6 +7,13 @@ LIST="/etc/ipv6-static.list"
 META="/etc/ipv6-static.meta"
 BACKUP_DIR="/etc/ipv6-static.backup"
 RESTORE_BIN="/usr/local/sbin/ipv6-static-restore"
+MONITOR_SERVICE="ipv6-static-monitor.service"
+MONITOR_UNIT="/etc/systemd/system/${MONITOR_SERVICE}"
+MONITOR_SCRIPT="/usr/local/sbin/ipv6-static-monitor"
+LEGACY_APPLY_SERVICE="ipv6-static-apply.service"
+LEGACY_APPLY_UNIT="/etc/systemd/system/${LEGACY_APPLY_SERVICE}"
+LEGACY_APPLY_TIMER="ipv6-static-apply.timer"
+LEGACY_APPLY_TIMER_UNIT="/etc/systemd/system/${LEGACY_APPLY_TIMER}"
 
 # ping 策略：0=失败只警告（避免 ICMP 被挡误回滚）；1=失败也回滚（更严格）
 STRICT_PING=0
@@ -61,6 +68,10 @@ restore_backup_state() {
   if [ -f "$BK/old_list" ]; then cp -f "$BK/old_list" "$LIST" || true; else rm -f "$LIST" || true; fi
   if [ -f "$BK/old_meta" ]; then cp -f "$BK/old_meta" "$META" || true; else rm -f "$META" || true; fi
   if [ -f "$BK/old_restore_bin" ]; then cp -p -f "$BK/old_restore_bin" "$RESTORE_BIN" || true; else rm -f "$RESTORE_BIN" || true; fi
+  if [ -f "$BK/old_monitor_unit" ]; then cp -f "$BK/old_monitor_unit" "$MONITOR_UNIT" || true; else rm -f "$MONITOR_UNIT" || true; fi
+  if [ -f "$BK/old_monitor_script" ]; then cp -p -f "$BK/old_monitor_script" "$MONITOR_SCRIPT" || true; else rm -f "$MONITOR_SCRIPT" || true; fi
+  if [ -f "$BK/old_apply_unit" ]; then cp -f "$BK/old_apply_unit" "$LEGACY_APPLY_UNIT" || true; else rm -f "$LEGACY_APPLY_UNIT" || true; fi
+  if [ -f "$BK/old_apply_timer" ]; then cp -f "$BK/old_apply_timer" "$LEGACY_APPLY_TIMER_UNIT" || true; else rm -f "$LEGACY_APPLY_TIMER_UNIT" || true; fi
 
   # 恢复 home 文件：如果原本就存在，恢复备份；否则删掉新建的
   if [ -f "$BK/home_list_preexisted" ] && [ -f "$BK/old_home_list" ]; then
@@ -86,12 +97,27 @@ rollback() {
 
   # 先读取旧状态：restore_backup_state 会删除 $BK 目录，不能在之后再读。
   local was_enabled=0
+  local monitor_enabled=0
+  local legacy_apply_timer_enabled=0
+  local legacy_apply_service_enabled=0
   if [ -n "${BK:-}" ] && [ -f "$BK/was_enabled" ] && grep -qx "enabled" "$BK/was_enabled"; then
     was_enabled=1
+  fi
+  if [ -n "${BK:-}" ] && [ -f "$BK/was_monitor_enabled" ] && grep -qx "enabled" "$BK/was_monitor_enabled"; then
+    monitor_enabled=1
+  fi
+  if [ -n "${BK:-}" ] && [ -f "$BK/was_legacy_apply_timer_enabled" ] && grep -qx "enabled" "$BK/was_legacy_apply_timer_enabled"; then
+    legacy_apply_timer_enabled=1
+  fi
+  if [ -n "${BK:-}" ] && [ -f "$BK/was_legacy_apply_service_enabled" ] && grep -qx "enabled" "$BK/was_legacy_apply_service_enabled"; then
+    legacy_apply_service_enabled=1
   fi
 
   warn "发生错误，开始回滚（恢复运行前状态，尽量不留残留）..."
   systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true
+  systemctl disable --now "$MONITOR_SERVICE" >/dev/null 2>&1 || true
+  systemctl disable --now "$LEGACY_APPLY_TIMER" >/dev/null 2>&1 || true
+  systemctl disable --now "$LEGACY_APPLY_SERVICE" >/dev/null 2>&1 || true
 
   if [ -n "${CHOSEN_IFACE:-}" ]; then
     cleanup_added_ips "$CHOSEN_IFACE"
@@ -102,6 +128,15 @@ rollback() {
 
   if [ "$was_enabled" -eq 1 ]; then
     systemctl enable --now "$SERVICE" >/dev/null 2>&1 || true
+  fi
+  if [ "$monitor_enabled" -eq 1 ]; then
+    systemctl enable --now "$MONITOR_SERVICE" >/dev/null 2>&1 || true
+  fi
+  if [ "$legacy_apply_timer_enabled" -eq 1 ]; then
+    systemctl enable --now "$LEGACY_APPLY_TIMER" >/dev/null 2>&1 || true
+  fi
+  if [ "$legacy_apply_service_enabled" -eq 1 ]; then
+    systemctl enable --now "$LEGACY_APPLY_SERVICE" >/dev/null 2>&1 || true
   fi
 
   warn "回滚完成。"
@@ -160,7 +195,14 @@ printf '%s' "$TS" > "$BACKUP_DIR/latest"
 [ -f "$LIST" ] && cp -f "$LIST" "$BK/old_list"
 [ -f "$META" ] && cp -f "$META" "$BK/old_meta"
 [ -f "$RESTORE_BIN" ] && cp -p -f "$RESTORE_BIN" "$BK/old_restore_bin"
+[ -f "$MONITOR_UNIT" ] && cp -f "$MONITOR_UNIT" "$BK/old_monitor_unit"
+[ -f "$MONITOR_SCRIPT" ] && cp -p -f "$MONITOR_SCRIPT" "$BK/old_monitor_script"
+[ -f "$LEGACY_APPLY_UNIT" ] && cp -f "$LEGACY_APPLY_UNIT" "$BK/old_apply_unit"
+[ -f "$LEGACY_APPLY_TIMER_UNIT" ] && cp -f "$LEGACY_APPLY_TIMER_UNIT" "$BK/old_apply_timer"
 if systemctl is-enabled "$SERVICE" >/dev/null 2>&1; then echo "enabled" > "$BK/was_enabled"; else echo "disabled" > "$BK/was_enabled"; fi
+if systemctl is-enabled "$MONITOR_SERVICE" >/dev/null 2>&1; then echo "enabled" > "$BK/was_monitor_enabled"; else echo "disabled" > "$BK/was_monitor_enabled"; fi
+if systemctl is-enabled "$LEGACY_APPLY_TIMER" >/dev/null 2>&1; then echo "enabled" > "$BK/was_legacy_apply_timer_enabled"; else echo "disabled" > "$BK/was_legacy_apply_timer_enabled"; fi
+if systemctl is-enabled "$LEGACY_APPLY_SERVICE" >/dev/null 2>&1; then echo "enabled" > "$BK/was_legacy_apply_service_enabled"; else echo "disabled" > "$BK/was_legacy_apply_service_enabled"; fi
 
 # 备份/标记 home 文件
 if [ -e "$HOME_LIST" ]; then
@@ -203,8 +245,8 @@ pick_global_cidr() {
 
 pick_connected_prefix() {
   local iface="$1"
-  ip -6 route show dev "$iface" proto kernel scope link 2>/dev/null \
-    | awk '{p=$1; if(p ~ /^fe80:/) next; if(p ~ /\/[0-9]+$/){print p; exit}}'
+  ip -6 route show dev "$iface" proto kernel 2>/dev/null \
+    | awk '{p=$1; if(p ~ /^fe80:/) next; n=split(p,a,"/"); if(n==2){len=a[2]+0; if(len>0 && len<128){print p; exit}}}'
 }
 
 CIDR="$(pick_global_cidr "$IFACE" || true)"
@@ -268,6 +310,20 @@ expand_ipv6() {
 
 norm6() { expand_ipv6 "$1" 2>/dev/null | tr -d ':' || true; }
 
+in_prefix_norm() {
+  local ip_norm="$1" base_norm="$2" plen="$3"
+  local full=$((plen/4))
+  local rem=$((plen%4))
+  [[ "${ip_norm:0:full}" = "${base_norm:0:full}" ]] || return 1
+  if (( rem > 0 )); then
+    local ip_nib="${ip_norm:full:1}"
+    local base_nib="${base_norm:full:1}"
+    local mask=$(( (0xF << (4-rem)) & 0xF ))
+    (( (0x$ip_nib & mask) == (0x$base_nib & mask) )) || return 1
+  fi
+  return 0
+}
+
 addr_line_by_norm() {
   local cand="$1"
   local candn; candn="$(norm6 "$cand")"
@@ -302,6 +358,7 @@ rand16_hex() {
 
 BASE_EXP="$(expand_ipv6 "$BASE_IP" || true)"
 [ -n "$BASE_EXP" ] || die "IPv6 expansion failed: BASE_IP may contain invalid characters"
+BASE_NORM="${BASE_EXP//:/}"
 IFS=':' read -r -a BASE_ARR <<< "$BASE_EXP" || true
 [ "${#BASE_ARR[@]}" -eq 8 ] || die "IPv6 expansion unexpected: BASE_IP -> $BASE_EXP"
 
@@ -327,11 +384,46 @@ gen_one_ip() {
   return 0
 }
 
-# -------------------- 生成 5 个地址 --------------------
+# -------------------- 生成 5 个地址（优先读取旧列表） --------------------
 ROLLBACK_NEEDED=1
+existing_ips=()
+existing_norms=()
+if [ -f "$LIST" ]; then
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    line="${line%%[[:space:]]*}"
+    [ -n "$line" ] || continue
+    norm_line="$(norm6 "$line")"
+    [ -n "$norm_line" ] || continue
+    if [ -n "${BASE_NORM:-}" ] && [ -n "${GEN_PFXLEN:-}" ] && [ "$GEN_PFXLEN" -gt 0 ]; then
+      in_prefix_norm "$norm_line" "$BASE_NORM" "$GEN_PFXLEN" || continue
+    fi
+    dup=0
+    for ipn in "${existing_norms[@]}"; do
+      [ "$ipn" = "$norm_line" ] && { dup=1; break; }
+    done
+    if [ "$dup" -eq 0 ]; then
+      existing_norms+=("$norm_line")
+      existing_ips+=("$line")
+    fi
+  done < "$LIST"
+fi
+
 : > "$LIST"
 chmod 600 "$LIST" || true
 count=0
+if [ "${#existing_ips[@]}" -gt 0 ]; then
+  if [ "${#existing_ips[@]}" -ge 5 ]; then
+    warn "existing list has >=5 addresses; using first 5"
+  else
+    warn "existing list has ${#existing_ips[@]} addresses; generating more"
+  fi
+  for ip6 in "${existing_ips[@]}"; do
+    echo "$ip6" >> "$LIST"
+    count=$((count+1))
+    [ "$count" -ge 5 ] && break
+  done
+fi
 while [ "$count" -lt 5 ]; do
   if ! ip6="$(gen_one_ip)"; then
     die "IPv6 generation failed (random or prefix parsing issue)"
@@ -347,22 +439,36 @@ done
 # -------------------- 选择添加方式（回退） --------------------
 try_add_del() {
   local ip6="$1" pfx="$2"; shift 2
-  local opts="$*"
-  if ip -6 addr add "$ip6/$pfx" dev "$IFACE" $opts 2>/dev/null; then
-    ip -6 addr del "$ip6/$pfx" dev "$IFACE" $opts 2>/dev/null || true
+  local -a opts=( "$@" )
+  if ip -6 addr add "$ip6/$pfx" dev "$IFACE" "${opts[@]}" 2>/dev/null; then
+    ip -6 addr del "$ip6/$pfx" dev "$IFACE" "${opts[@]}" 2>/dev/null || true
     return 0
   fi
   return 1
 }
 
 first_ip="$(head -n1 "$LIST")"
-if try_add_del "$first_ip" 128 "noprefixroute"; then
+# 作为“探测添加方式”的探针 IP：如果 first_ip 已经存在于网卡上（脚本二次运行很常见），
+# 则临时生成一个不冲突的地址来测试添加/删除能力（不写入 LIST、不持久化）。
+probe_ip="$first_ip"
+if addr_line_by_norm "$probe_ip" >/dev/null 2>&1; then
+  for (( _i=0; _i<50; _i++ )); do
+    cand="$(gen_one_ip)" || break
+    [ -n "$cand" ] || continue
+    grep -qx "$cand" "$LIST" 2>/dev/null && continue
+    if ! addr_line_by_norm "$cand" >/dev/null 2>&1; then
+      probe_ip="$cand"
+      break
+    fi
+  done
+fi
+if try_add_del "$probe_ip" 128 "noprefixroute"; then
   ASSIGN_PFXLEN=128; ASSIGN_OPTS="noprefixroute"
-elif try_add_del "$first_ip" 128 ""; then
+elif try_add_del "$probe_ip" 128 ""; then
   ASSIGN_PFXLEN=128; ASSIGN_OPTS=""
-elif try_add_del "$first_ip" "$GEN_PFXLEN" ""; then
+elif try_add_del "$probe_ip" "$GEN_PFXLEN" ""; then
   ASSIGN_PFXLEN="$GEN_PFXLEN"; ASSIGN_OPTS=""
-elif try_add_del "$first_ip" "$GEN_PFXLEN" "noprefixroute"; then
+elif try_add_del "$probe_ip" "$GEN_PFXLEN" "noprefixroute"; then
   ASSIGN_PFXLEN="$GEN_PFXLEN"; ASSIGN_OPTS="noprefixroute"
 else
   die "多种方式仍无法添加 IPv6（可能服务商禁用额外 IPv6 或需要额外网络设置）"
@@ -371,6 +477,9 @@ log "✅ 添加方式：/$ASSIGN_PFXLEN ${ASSIGN_OPTS:-"(no extra opts)"}"
 
 # -------------------- 写 unit 并启动 --------------------
 systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true
+systemctl disable --now "$MONITOR_SERVICE" >/dev/null 2>&1 || true
+systemctl disable --now "$LEGACY_APPLY_TIMER" >/dev/null 2>&1 || true
+systemctl disable --now "$LEGACY_APPLY_SERVICE" >/dev/null 2>&1 || true
 
 IP_BIN="$(command -v ip 2>/dev/null || true)"
 [ -n "$IP_BIN" ] || IP_BIN="/usr/sbin/ip"
@@ -412,8 +521,62 @@ cat >> "$UNIT" <<EOF
 WantedBy=multi-user.target
 EOF
 
+cat > "$MONITOR_SCRIPT" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+IP_CMD="$IP_BIN"
+IFACE="$IFACE"
+ASSIGN_PFXLEN="$ASSIGN_PFXLEN"
+ASSIGN_OPTS="$ASSIGN_OPTS"
+LIST_PATH="$LIST"
+
+add_ips() {
+  [ -f "$LIST_PATH" ] || return 0
+  while IFS= read -r line; do
+    line="\${line%%#*}"
+    line="\${line%%[[:space:]]*}"
+    [ -n "\$line" ] || continue
+    if [ -n "\$ASSIGN_OPTS" ]; then
+      \$IP_CMD -6 addr add "\$line/\$ASSIGN_PFXLEN" dev "\$IFACE" \$ASSIGN_OPTS 2>/dev/null || true
+    else
+      \$IP_CMD -6 addr add "\$line/\$ASSIGN_PFXLEN" dev "\$IFACE" 2>/dev/null || true
+    fi
+  done < "\$LIST_PATH"
+}
+
+add_ips
+while true; do
+  if (set +o pipefail; \$IP_CMD -6 monitor address dev "\$IFACE" 2>/dev/null | grep -m 1 -qi "Deleted"); then
+    add_ips
+    sleep 1
+  else
+    sleep 1
+  fi
+done
+EOF
+chmod +x "$MONITOR_SCRIPT"
+
+cat > "$MONITOR_UNIT" <<EOF
+[Unit]
+Description=IPv6 Static Address Monitor (event-driven)
+Wants=network-online.target
+After=network-online.target
+PartOf=$SERVICE
+ConditionPathExists=/sys/class/net/$IFACE
+
+[Service]
+Type=simple
+ExecStart=$MONITOR_SCRIPT
+Restart=always
+RestartSec=3s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reload
 systemctl enable --now "$SERVICE"
+systemctl enable --now "$MONITOR_SERVICE"
 
 # -------------------- 绑定验证（用归一化避免 :: 压缩误判） --------------------
 verify_count() {
@@ -508,6 +671,13 @@ UNIT="/etc/systemd/system/${SERVICE}"
 LIST="/etc/ipv6-static.list"
 META="/etc/ipv6-static.meta"
 BACKUP_DIR="/etc/ipv6-static.backup"
+MONITOR_SERVICE="ipv6-static-monitor.service"
+MONITOR_UNIT="/etc/systemd/system/${MONITOR_SERVICE}"
+MONITOR_SCRIPT="/usr/local/sbin/ipv6-static-monitor"
+LEGACY_APPLY_SERVICE="ipv6-static-apply.service"
+LEGACY_APPLY_UNIT="/etc/systemd/system/${LEGACY_APPLY_SERVICE}"
+LEGACY_APPLY_TIMER="ipv6-static-apply.timer"
+LEGACY_APPLY_TIMER_UNIT="/etc/systemd/system/${LEGACY_APPLY_TIMER}"
 
 log(){ printf '%s\n' "$*"; }
 die(){ log "❌ $*"; exit 1; }
@@ -562,6 +732,9 @@ do_uninstall_clean() {
   iface="$(detect_iface || true)"
 
   systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true
+  systemctl disable --now "$MONITOR_SERVICE" >/dev/null 2>&1 || true
+  systemctl disable --now "$LEGACY_APPLY_TIMER" >/dev/null 2>&1 || true
+  systemctl disable --now "$LEGACY_APPLY_SERVICE" >/dev/null 2>&1 || true
   [ -n "${iface:-}" ] && remove_ips "$iface"
 
   read_meta
@@ -575,7 +748,7 @@ do_uninstall_clean() {
     fi
   fi
 
-  rm -f "$UNIT" "$LIST" "$META" 2>/dev/null || true
+  rm -f "$UNIT" "$LIST" "$META" "$MONITOR_UNIT" "$MONITOR_SCRIPT" "$LEGACY_APPLY_UNIT" "$LEGACY_APPLY_TIMER_UNIT" 2>/dev/null || true
   systemctl daemon-reload >/dev/null 2>&1 || true
 
   # 卸载就是彻底清理备份目录
@@ -597,15 +770,33 @@ do_restore_previous() {
   iface="$(detect_iface || true)"
 
   systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true
+  systemctl disable --now "$MONITOR_SERVICE" >/dev/null 2>&1 || true
+  systemctl disable --now "$LEGACY_APPLY_TIMER" >/dev/null 2>&1 || true
+  systemctl disable --now "$LEGACY_APPLY_SERVICE" >/dev/null 2>&1 || true
   [ -n "${iface:-}" ] && remove_ips "$iface"
 
   [ -f "$bk/old_unit" ] && cp -f "$bk/old_unit" "$UNIT" || rm -f "$UNIT" || true
   [ -f "$bk/old_list" ] && cp -f "$bk/old_list" "$LIST" || rm -f "$LIST" || true
   [ -f "$bk/old_meta" ] && cp -f "$bk/old_meta" "$META" || rm -f "$META" || true
+  [ -f "$bk/old_monitor_unit" ] && cp -f "$bk/old_monitor_unit" "$MONITOR_UNIT" || rm -f "$MONITOR_UNIT" || true
+  [ -f "$bk/old_monitor_script" ] && cp -p -f "$bk/old_monitor_script" "$MONITOR_SCRIPT" || rm -f "$MONITOR_SCRIPT" || true
+  [ -f "$bk/old_apply_unit" ] && cp -f "$bk/old_apply_unit" "$LEGACY_APPLY_UNIT" || rm -f "$LEGACY_APPLY_UNIT" || true
+  [ -f "$bk/old_apply_timer" ] && cp -f "$bk/old_apply_timer" "$LEGACY_APPLY_TIMER_UNIT" || rm -f "$LEGACY_APPLY_TIMER_UNIT" || true
 
   systemctl daemon-reload >/dev/null 2>&1 || true
   if [ -f "$bk/was_enabled" ] && grep -qx "enabled" "$bk/was_enabled"; then
     systemctl enable --now "$SERVICE" >/dev/null 2>&1 || true
+  fi
+  if [ -f "$bk/was_monitor_enabled" ] && grep -qx "enabled" "$bk/was_monitor_enabled"; then
+    systemctl enable --now "$MONITOR_SERVICE" >/dev/null 2>&1 || true
+  fi
+  if [ -f "$bk/was_legacy_apply_timer_enabled" ] && grep -qx "enabled" "$bk/was_legacy_apply_timer_enabled"; then
+    systemctl enable --now "$LEGACY_APPLY_TIMER" >/dev/null 2>&1 || true
+  elif [ -f "$bk/was_apply_timer_enabled" ] && grep -qx "enabled" "$bk/was_apply_timer_enabled"; then
+    systemctl enable --now "$LEGACY_APPLY_TIMER" >/dev/null 2>&1 || true
+  fi
+  if [ -f "$bk/was_legacy_apply_service_enabled" ] && grep -qx "enabled" "$bk/was_legacy_apply_service_enabled"; then
+    systemctl enable --now "$LEGACY_APPLY_SERVICE" >/dev/null 2>&1 || true
   fi
 
   log "✅ 已恢复到运行脚本前的旧版本（如果当时存在）。"
