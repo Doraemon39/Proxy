@@ -509,7 +509,7 @@ elif try_add_del "$probe_ip" "$GEN_PFXLEN" "noprefixroute"; then
 else
   die "多种方式仍无法添加 IPv6（可能服务商禁用额外 IPv6 或需要额外网络设置）"
 fi
-log "✅ 添加方式：/$ASSIGN_PFXLEN ${ASSIGN_OPTS:-"(no extra opts)"}"
+log "✅ 添加方式：/$ASSIGN_PFXLEN ${ASSIGN_OPTS:-(no extra opts)}"
 
 # -------------------- 写 unit 并启动 --------------------
 systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true
