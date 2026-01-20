@@ -283,6 +283,12 @@ fi
 log "✅ 主IPv6: $CURRENT_IP/$PFXLEN_ADDR"
 log "✅ 生成前缀: $BASE_IP/$GEN_PFXLEN"
 
+# -------------------- 前缀容量校验：避免 /126、/127 等导致生成 5 个地址进入死循环 --------------------
+HOST_BITS=$((128 - GEN_PFXLEN))
+if [ "$HOST_BITS" -lt 3 ]; then
+  die "检测到前缀 /$GEN_PFXLEN（可用地址数量 <= 4），无法生成 5 个不重复 IPv6。需要至少 /125 或更短（通常为 /64）。"
+fi
+
 # -------------------- IPv6 展开/归一化（解决 :: 压缩导致的误判） --------------------
 expand_ipv6() {
   local ip="${1%%/*}"
@@ -444,7 +450,13 @@ if [ "${#existing_ips[@]}" -gt 0 ]; then
     [ "$count" -ge 5 ] && break
   done
 fi
+attempts=0
+max_attempts=2000
 while [ "$count" -lt 5 ]; do
+  attempts=$((attempts+1))
+  if [ "$attempts" -gt "$max_attempts" ]; then
+    die "IPv6 生成失败：尝试次数过多仍无法得到 5 个不重复地址。当前前缀 /$GEN_PFXLEN 可能过窄。"
+  fi
   if ! ip6="$(gen_one_ip)"; then
     die "IPv6 generation failed (random or prefix parsing issue)"
   fi
