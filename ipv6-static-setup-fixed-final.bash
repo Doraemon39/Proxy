@@ -893,6 +893,14 @@ do_restore_previous() {
   systemctl disable --now "$LEGACY_APPLY_SERVICE" >/dev/null 2>&1 || true
   [ -n "${iface:-}" ] && remove_ips "$iface"
 
+  if [ -n "${HOME_LIST_PATH:-}" ]; then
+    if [ "$HOME_LIST_PREEXISTED" -eq 1 ] && [ -f "$bk/old_home_list" ]; then
+      cp -f "$bk/old_home_list" "$HOME_LIST_PATH" 2>/dev/null || true
+    else
+      rm -f "$HOME_LIST_PATH" 2>/dev/null || true
+    fi
+  fi
+
   [ -f "$bk/old_unit" ] && cp -f "$bk/old_unit" "$UNIT" || rm -f "$UNIT" || true
   [ -f "$bk/old_list" ] && cp -f "$bk/old_list" "$LIST" || rm -f "$LIST" || true
   [ -f "$bk/old_meta" ] && cp -f "$bk/old_meta" "$META" || rm -f "$META" || true
