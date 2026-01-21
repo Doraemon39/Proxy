@@ -113,7 +113,7 @@
         "outboundTag": "block"
       },
 
-      // 建议：屏蔽 QUIC，避免 UDP/443 绕开你的 IPv6 策略
+      // 如果需要：屏蔽 QUIC，避免 UDP/443 绕开你的 IPv6 策略
       // 也可改成更严格：network=udp + port=443
       {
         "type": "field",
@@ -153,6 +153,31 @@
 
 1. 只有当路由系统能把“域名”解析成 IP，`ip: ["::/0"]` 才可能匹配到 IPv6。
 2. **routing** 必须开 `IPOnDemand` 或 `IPIfNonMatch `
+
+
+
+**3.建议显式配置 DNS（推荐）**
+
+```bash
+"dns": {
+  "queryStrategy": "UseIP",
+  "servers": [
+    "1.1.1.1",
+    "8.8.8.8",
+    "2606:4700:4700::1111",
+    "2001:4860:4860::8888"
+  ]
+}
+```
+
+**机制要求**：官方文档明确指出，路由阶段的 `IPOnDemand`（即通过 IP 规则匹配域名）以及 `freedom` 出站的 `UseIP` 策略，均依赖 Xray 的 **内置 DNS** 进行解析。
+
+**行为差异**：
+
+- **非 AsIs 模式（UseIP/ForceIPv6 等）**：Xray 会执行“先解析 IP，再建立连接”的逻辑。此时优先使用内置 DNS；若未配置内置 DNS，则会回退调用系统 DNS，结果可能不可控。
+- **AsIs 模式**：直接将域名交给系统（类似 Go 的 `net.Dial`），完全依赖操作系统的解析器和 RFC6724 地址选择逻辑（通常由系统决定 IPv4/v6 优先级）。
+
+**结论**：为了让你的 `::/0` 规则能稳定命中 IPv6，推荐配置内置 DNS 并开启 `UseIP`，避免因回退系统 DNS 导致拿不到 AAAA 记录的问题。
 
 
 
@@ -306,12 +331,21 @@ Xray 在 `streamSettings.sockopt.happyEyeballs` 提供了 RFC-8305 实现，并�
 
 完整Xray-Core Reality模板：
 
-```
+```bash
 {
   "log": {
     "access": "none",
     "error": "none",
     "loglevel": "warning"
+  },
+  "dns": {
+    "queryStrategy": "UseIP",
+    "servers": [
+      "1.1.1.1",
+      "8.8.8.8",
+      "2606:4700:4700::1111",
+      "2001:4860:4860::8888"
+    ]
   },
   "routing": {
     "domainStrategy": "IPOnDemand",
