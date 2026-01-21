@@ -332,13 +332,6 @@ Xray 在 `streamSettings.sockopt.happyEyeballs` 提供了 RFC-8305 实现，并�
       },
       {
         "type": "field",
-        "protocol": [
-          "quic"
-        ],
-        "outboundTag": "block"
-      },
-      {
-        "type": "field",
         "user": [
           "user1@email.com"
         ],
@@ -508,3 +501,10 @@ Xray 在 `streamSettings.sockopt.happyEyeballs` 提供了 RFC-8305 实现，并�
 }
 ```
 
+* **UUID**：是客户端用于建立连接的**唯一认证凭证（即密码）**，必须保密且与客户端配置完全一致。
+
+- **Email**：仅作为服务端内部用于识别流量并匹配特定出口规则的**逻辑标识（即标签）**。
+
+**⚠️ 注意**：此处的 `email` 字段与其字面意思无关，**无需填写真实邮箱**。它本质上是一个用于区分用户的**任意自定义字符串**。
+
+**配置公式**： `Inbound 里的 email` **=** `流量的 Tag` **=** `Routing 规则里的 User`
