@@ -366,6 +366,13 @@ Xray 在 `streamSettings.sockopt.happyEyeballs` 提供了 RFC-8305 实现，并�
       },
       {
         "type": "field",
+        "protocol": [
+          "quic"
+        ],
+        "outboundTag": "out-ipv4-only"
+      },
+      {
+        "type": "field",
         "user": [
           "user1@email.com"
         ],
@@ -413,6 +420,11 @@ Xray 在 `streamSettings.sockopt.happyEyeballs` 提供了 RFC-8305 实现，并�
           "::/0"
         ],
         "outboundTag": "out-v6-5"
+      },
+      {
+        "type": "field",
+        "network": "tcp,udp",
+        "outboundTag": "out-ipv4-only"
       }
     ]
   },
