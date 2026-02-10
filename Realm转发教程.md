@@ -9,7 +9,7 @@ Github地址：https://github.com/zhboner/realm
 2.安装realm
 
 ```
-wget https://github.com/zhboner/realm/releases/download/v2.7.0/realm-x86_64-unknown-linux-gnu.tar.gz
+wget https://github.com/zhboner/realm/releases/download/v2.9.3/realm-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 ```
@@ -27,7 +27,7 @@ sudo mv realm /usr/local/bin/
 3.创建配置文件 
 
 ```
-nano realm.toml
+nano /root/realm.toml
 ```
 
 这是作者发的模板：https://github.com/zhboner/realm/blob/master/examples/full.toml
@@ -36,8 +36,8 @@ nano realm.toml
 
 ```
 [log]
-level = "warn"
-output = "/root/realm.log"
+level = "off"
+#output = "/root/realm.log"
 
 #如果DNS异常才用这个
 #[dns]
@@ -64,7 +64,9 @@ remote = "[::]:端口"
 
 4.设置开机启动
 
+```
 nano /etc/systemd/system/realm.service
+```
 
 然后在里面写入
 
@@ -80,6 +82,7 @@ ExecStart=/usr/local/bin/realm -c /root/realm.toml
 Restart=on-failure
 RestartSec=5
 User=root
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
