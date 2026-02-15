@@ -27,6 +27,7 @@ EXTRA_CAKE_OPTS="${EXTRA_CAKE_OPTS-}"
 DISABLE_OFFLOAD="${DISABLE_OFFLOAD:-yes}"  # yes/no；默认关闭 WAN 口 tso/gso/gro
 DELETE_IFB_ON_STOP="${DELETE_IFB_ON_STOP:-no}"  # yes/no；yes 时 stop 会删除 IFB 设备
 INGRESS_PREF="${INGRESS_PREF:-49152}"           # 用固定 pref 标记本脚本创建的 ingress filter
+OFFLOAD_STATE_DIR="${OFFLOAD_STATE_DIR:-/run/qos-cake}"  # offload 状态文件目录
 
 CMD="${1:-}"
 WAN_IF="${WAN_IF-}"
@@ -126,12 +127,70 @@ preflight_runtime_cmds() {
   require_cmd_or_exit grep
 }
 
+offload_state_file() {
+  local dev="$1"
+  local safe="$dev"
+
+  safe="${safe//\//_}"
+  safe="${safe//:/_}"
+
+  echo "$OFFLOAD_STATE_DIR/offload-${safe}.state"
+}
+
+capture_offload_state_if_needed() {
+  local dev="$1"
+  local state_file="$2"
+  local tmp_file=""
+  local tso=""
+  local gso=""
+  local gro=""
+
+  if [[ -r "$state_file" && -s "$state_file" ]]; then
+    tso="$(awk -F= '/^TSO=/{print $2; exit}' "$state_file" || true)"
+    gso="$(awk -F= '/^GSO=/{print $2; exit}' "$state_file" || true)"
+    gro="$(awk -F= '/^GRO=/{print $2; exit}' "$state_file" || true)"
+    if [[ "$tso" =~ ^(on|off)$ && "$gso" =~ ^(on|off)$ && "$gro" =~ ^(on|off)$ ]]; then
+      return 0
+    fi
+    echo "WARN: Existing offload state file '$state_file' is invalid; recapturing." >&2
+    rm -f "$state_file" 2>/dev/null || true
+  fi
+
+  tso="$(ethtool -k "$dev" 2>/dev/null | awk '/^[[:space:]]*tcp-segmentation-offload:/ {print $2; exit}' || true)"
+  gso="$(ethtool -k "$dev" 2>/dev/null | awk '/^[[:space:]]*generic-segmentation-offload:/ {print $2; exit}' || true)"
+  gro="$(ethtool -k "$dev" 2>/dev/null | awk '/^[[:space:]]*generic-receive-offload:/ {print $2; exit}' || true)"
+
+  if [[ "$tso" =~ ^(on|off)$ && "$gso" =~ ^(on|off)$ && "$gro" =~ ^(on|off)$ ]]; then
+    if mkdir -p "$OFFLOAD_STATE_DIR" 2>/dev/null; then
+      tmp_file="${state_file}.tmp.$$"
+      if printf 'TSO=%s\nGSO=%s\nGRO=%s\n' "$tso" "$gso" "$gro" >"$tmp_file" 2>/dev/null && \
+        mv -f "$tmp_file" "$state_file" 2>/dev/null; then
+        return 0
+      fi
+      rm -f "$tmp_file" 2>/dev/null || true
+    fi
+
+    echo "WARN: Failed to save offload state to '$state_file'." >&2
+    return 1
+  fi
+
+  echo "WARN: Could not read current tso/gso/gro state for '$dev'." >&2
+  return 1
+}
+
 disable_offload_if_needed() {
   local dev="$1"
+  local state_file=""
 
   [[ "${DISABLE_OFFLOAD,,}" == "yes" ]] || return 0
   if ! command -v ethtool >/dev/null 2>&1; then
     echo "WARN: ethtool not found; skipping offload disable on '$dev'." >&2
+    return 0
+  fi
+
+  state_file="$(offload_state_file "$dev")"
+  if ! capture_offload_state_if_needed "$dev" "$state_file"; then
+    echo "WARN: Offload state is unavailable for '$dev'; skipping offload disable to keep stop/start reversible." >&2
     return 0
   fi
 
@@ -141,8 +200,62 @@ disable_offload_if_needed() {
   fi
 }
 
+restore_offload_if_needed() {
+  local dev="$1"
+  local state_file=""
+  local tso=""
+  local gso=""
+  local gro=""
+
+  [[ "${DISABLE_OFFLOAD,,}" == "yes" ]] || return 0
+  if ! command -v ethtool >/dev/null 2>&1; then
+    echo "WARN: ethtool not found; skipping offload restore on '$dev'." >&2
+    return 0
+  fi
+
+  state_file="$(offload_state_file "$dev")"
+  if [[ ! -r "$state_file" ]]; then
+    echo "INFO: Offload state file not found for '$dev'; skipping offload restore." >&2
+    return 0
+  fi
+
+  tso="$(awk -F= '/^TSO=/{print $2; exit}' "$state_file" || true)"
+  gso="$(awk -F= '/^GSO=/{print $2; exit}' "$state_file" || true)"
+  gro="$(awk -F= '/^GRO=/{print $2; exit}' "$state_file" || true)"
+
+  if [[ ! "$tso" =~ ^(on|off)$ || ! "$gso" =~ ^(on|off)$ || ! "$gro" =~ ^(on|off)$ ]]; then
+    echo "WARN: Invalid offload state in '$state_file'; skipping restore." >&2
+    rm -f "$state_file" 2>/dev/null || true
+    return 1
+  fi
+
+  if ! ethtool -K "$dev" tso "$tso" gso "$gso" gro "$gro" >/dev/null 2>&1; then
+    echo "WARN: Failed to restore tso/gso/gro on '$dev'; NIC may remain CPU-heavy." >&2
+    return 1
+  fi
+
+  rm -f "$state_file" 2>/dev/null || true
+}
+
+remove_wan_cake_root_if_present() {
+  local dev="$1"
+
+  if ! tc qdisc show dev "$dev" 2>/dev/null | grep -qE '\bqdisc[[:space:]]+cake\b.*\broot\b'; then
+    echo "INFO: Root qdisc on '$dev' is not cake, skipping root qdisc delete." >&2
+    return 0
+  fi
+
+  tc qdisc del dev "$dev" root 2>/dev/null || true
+
+  if tc qdisc show dev "$dev" 2>/dev/null | grep -qE '\bqdisc[[:space:]]+cake\b.*\broot\b'; then
+    echo "ERROR: Failed to remove CAKE root qdisc on '$dev'." >&2
+    return 1
+  fi
+}
+
 apply_egress() {
   local dev="$1"
+  local nf=""
 
   warn_virt_limits
   modprobe sch_cake 2>/dev/null || true
@@ -222,6 +335,7 @@ setup_ingress_redirect() {
 apply_ingress_via_ifb() {
   local wan="$1"
   local ifb="$2"
+  local nf=""
 
   # DOWN_BW 为空视为显式关闭下行整形，并清理残留（仅清理本脚本 filter）
   if [[ -z "$DOWN_BW" ]]; then
@@ -279,21 +393,19 @@ start() {
 
 stop() {
   preflight_runtime_cmds
+  local stop_failed=0
 
   if [[ -z "$WAN_IF" ]]; then
     WAN_IF="$(detect_wan_if || true)"
   fi
 
   if [[ -n "$WAN_IF" ]]; then
-    # 避免误删其他程序配置的非-cake root qdisc
-    if tc qdisc show dev "$WAN_IF" 2>/dev/null | grep -qE '\bqdisc[[:space:]]+cake\b.*\broot\b'; then
-      tc qdisc del dev "$WAN_IF" root 2>/dev/null || true
-    else
-      echo "INFO: Root qdisc on '$WAN_IF' is not cake, skipping root qdisc delete." >&2
-    fi
+    remove_wan_cake_root_if_present "$WAN_IF" || stop_failed=1
     delete_ingress_redirect_filters "$WAN_IF"
+    restore_offload_if_needed "$WAN_IF" || stop_failed=1
   else
     echo "WARN: Cannot detect WAN interface, skipping WAN qdisc cleanup." >&2
+    stop_failed=1
   fi
 
   # IFB 清理（默认不删设备，避免影响其他服务）
@@ -302,6 +414,8 @@ stop() {
     ip link set "$IFB_DEV" down 2>/dev/null || true
     ip link del "$IFB_DEV" 2>/dev/null || true
   fi
+
+  (( stop_failed == 0 )) || return 1
 }
 
 status() {
