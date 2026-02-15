@@ -462,7 +462,7 @@ DIFFSERV="diffserv4"           # diffserv4 常用；不想分级就留空：DIFF
 # auto：检测到有 MASQUERADE/masquerade 规则才加 nat
 # yes：强制加 nat（你确认是路由/NAT 网关时）
 # no：不加 nat（大多数“单机 VPS”建议 no 或 auto）
-NAT="auto"
+NAT="no"
 
 # ===== 可选优化 =====
 ACK_FILTER="yes"               # 上行整形 + 大量下载时 ACK 回传可能有帮助；不想要可改 no
