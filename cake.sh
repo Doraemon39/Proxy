@@ -26,6 +26,8 @@ IFB_DEV="${IFB_DEV:-ifb0}"
 EXTRA_CAKE_OPTS="${EXTRA_CAKE_OPTS-}"
 DISABLE_OFFLOAD="${DISABLE_OFFLOAD:-yes}"  # yes/no；默认关闭 WAN 口 tso/gso/gro
 DELETE_IFB_ON_STOP="${DELETE_IFB_ON_STOP:-no}"  # yes/no；yes 时 stop 会删除 IFB 设备
+ALLOW_IFB_REUSE="${ALLOW_IFB_REUSE:-no}"        # yes/no；yes 时允许覆盖非本脚本标记的 IFB root qdisc
+ALLOW_UNOWNED_WAN_CAKE_DELETE="${ALLOW_UNOWNED_WAN_CAKE_DELETE:-no}"  # yes/no；yes 时允许删除无 ownership marker 的 WAN root cake
 INGRESS_PREF="${INGRESS_PREF:-49152}"           # 用固定 pref 标记本脚本创建的 ingress filter
 OFFLOAD_STATE_DIR="${OFFLOAD_STATE_DIR:-/run/qos-cake}"  # offload 状态文件目录
 
@@ -97,6 +99,280 @@ require_cmd_or_exit() {
   fi
 }
 
+is_ifb_device() {
+  local dev="$1"
+
+  ip -o link show type ifb 2>/dev/null | \
+    awk -F': ' '{name=$2; sub(/@.*/, "", name); print name}' | \
+    grep -Fxq "$dev"
+}
+
+ifb_created_state_file() {
+  local dev="$1"
+  local safe="$dev"
+
+  safe="${safe//\//_}"
+  safe="${safe//:/_}"
+
+  echo "$OFFLOAD_STATE_DIR/ifb-created-${safe}.state"
+}
+
+save_ifb_created_state() {
+  local ifb="$1"
+  local state_file=""
+  local tmp_file=""
+
+  state_file="$(ifb_created_state_file "$ifb")"
+  if ! mkdir -p "$OFFLOAD_STATE_DIR" 2>/dev/null; then
+    echo "WARN: Failed to create state directory '$OFFLOAD_STATE_DIR'; IFB ownership marker is unavailable." >&2
+    return 1
+  fi
+
+  tmp_file="${state_file}.tmp.$$"
+  if printf '%s\n' "$ifb" >"$tmp_file" 2>/dev/null && \
+    mv -f "$tmp_file" "$state_file" 2>/dev/null; then
+    return 0
+  fi
+
+  rm -f "$tmp_file" 2>/dev/null || true
+  echo "WARN: Failed to save IFB ownership marker to '$state_file'." >&2
+  return 1
+}
+
+ifb_is_marked_as_created() {
+  local ifb="$1"
+  local state_file=""
+  local dev=""
+
+  state_file="$(ifb_created_state_file "$ifb")"
+  [[ -r "$state_file" ]] || return 1
+
+  dev="$(awk 'NR==1 {print; exit}' "$state_file" 2>/dev/null || true)"
+  dev="${dev%$'\r'}"
+  if [[ "$dev" == "$ifb" ]]; then
+    return 0
+  fi
+
+  rm -f "$state_file" 2>/dev/null || true
+  return 1
+}
+
+clear_ifb_created_state() {
+  local ifb="$1"
+  local state_file=""
+
+  state_file="$(ifb_created_state_file "$ifb")"
+  rm -f "$state_file" 2>/dev/null || true
+}
+
+ifb_qdisc_state_file() {
+  local dev="$1"
+  local safe="$dev"
+
+  safe="${safe//\//_}"
+  safe="${safe//:/_}"
+
+  echo "$OFFLOAD_STATE_DIR/ifb-qdisc-${safe}.state"
+}
+
+save_ifb_qdisc_state() {
+  local ifb="$1"
+  local state_file=""
+  local tmp_file=""
+
+  state_file="$(ifb_qdisc_state_file "$ifb")"
+  if ! mkdir -p "$OFFLOAD_STATE_DIR" 2>/dev/null; then
+    echo "WARN: Failed to create state directory '$OFFLOAD_STATE_DIR'; IFB qdisc ownership marker is unavailable." >&2
+    return 1
+  fi
+
+  tmp_file="${state_file}.tmp.$$"
+  if printf '%s\n' "$ifb" >"$tmp_file" 2>/dev/null && \
+    mv -f "$tmp_file" "$state_file" 2>/dev/null; then
+    return 0
+  fi
+
+  rm -f "$tmp_file" 2>/dev/null || true
+  echo "WARN: Failed to save IFB qdisc ownership marker to '$state_file'." >&2
+  return 1
+}
+
+ifb_qdisc_is_owned() {
+  local ifb="$1"
+  local state_file=""
+  local dev=""
+
+  state_file="$(ifb_qdisc_state_file "$ifb")"
+  [[ -r "$state_file" ]] || return 1
+
+  dev="$(awk 'NR==1 {print; exit}' "$state_file" 2>/dev/null || true)"
+  dev="${dev%$'\r'}"
+  if [[ "$dev" == "$ifb" ]]; then
+    return 0
+  fi
+
+  rm -f "$state_file" 2>/dev/null || true
+  return 1
+}
+
+clear_ifb_qdisc_state() {
+  local ifb="$1"
+  local state_file=""
+
+  state_file="$(ifb_qdisc_state_file "$ifb")"
+  rm -f "$state_file" 2>/dev/null || true
+}
+
+should_skip_unowned_ifb_cleanup() {
+  local ifb="$1"
+
+  [[ "${ALLOW_IFB_REUSE,,}" == "yes" ]] && return 1
+  ip link show "$ifb" >/dev/null 2>&1 || return 1
+  is_ifb_device "$ifb" || return 1
+  [[ "$(ifb_root_qdisc_kind "$ifb")" == "cake" ]] || return 1
+  if ifb_is_marked_as_created "$ifb" || ifb_qdisc_is_owned "$ifb"; then
+    return 1
+  fi
+  return 0
+}
+
+cleanup_ifb_qdisc_if_safe() {
+  local ifb="$1"
+  local root_kind=""
+
+  if ! ip link show "$ifb" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if ! is_ifb_device "$ifb"; then
+    echo "WARN: '$ifb' exists but is not an ifb device; skipping IFB qdisc cleanup." >&2
+    return 1
+  fi
+
+  root_kind="$(ifb_root_qdisc_kind "$ifb")"
+  if [[ "$root_kind" != "cake" ]]; then
+    clear_ifb_qdisc_state "$ifb"
+    echo "INFO: Root qdisc on '$ifb' is not cake, skipping IFB root qdisc delete." >&2
+    return 0
+  fi
+
+  if ! ifb_is_marked_as_created "$ifb" && ! ifb_qdisc_is_owned "$ifb"; then
+    if [[ "${ALLOW_IFB_REUSE,,}" == "yes" ]]; then
+      echo "WARN: IFB '$ifb' root cake is unmarked; deleting due to ALLOW_IFB_REUSE=yes." >&2
+    else
+      echo "ERROR: IFB '$ifb' root cake is unmarked; refusing to delete without ALLOW_IFB_REUSE=yes." >&2
+      return 1
+    fi
+  fi
+
+  tc qdisc del dev "$ifb" root 2>/dev/null || true
+
+  if [[ "$(ifb_root_qdisc_kind "$ifb")" == "cake" ]]; then
+    echo "ERROR: Failed to remove CAKE root qdisc on IFB '$ifb'." >&2
+    return 1
+  fi
+
+  clear_ifb_qdisc_state "$ifb"
+}
+
+ifb_root_qdisc_kind() {
+  local ifb="$1"
+  local kind=""
+
+  kind="$(tc qdisc show dev "$ifb" 2>/dev/null | awk '$4=="root" {print $2; exit}' || true)"
+  echo "$kind"
+}
+
+validate_ifb_reuse_policy() {
+  local ifb="$1"
+  local root_kind=""
+
+  case "${ALLOW_IFB_REUSE,,}" in
+    yes|no) : ;;
+    *)
+      echo "ERROR: Invalid ALLOW_IFB_REUSE=$ALLOW_IFB_REUSE (use yes/no)." >&2
+      return 1
+      ;;
+  esac
+
+  root_kind="$(ifb_root_qdisc_kind "$ifb")"
+  [[ -z "$root_kind" || "$root_kind" == "noqueue" ]] && return 0
+
+  if [[ "$root_kind" == "cake" ]]; then
+    if ifb_is_marked_as_created "$ifb" || ifb_qdisc_is_owned "$ifb"; then
+      return 0
+    fi
+  fi
+
+  if [[ "${ALLOW_IFB_REUSE,,}" == "yes" ]]; then
+    echo "WARN: Reusing IFB '$ifb' with existing root qdisc '$root_kind' because ALLOW_IFB_REUSE=yes." >&2
+    return 0
+  fi
+
+  if ifb_is_marked_as_created "$ifb" || ifb_qdisc_is_owned "$ifb"; then
+    echo "ERROR: IFB '$ifb' has unexpected root qdisc '$root_kind' despite ownership marker." >&2
+  else
+    echo "ERROR: IFB '$ifb' already has root qdisc '$root_kind' and is not marked as created by this script." >&2
+  fi
+  echo "ERROR: Refusing to overwrite IFB root qdisc. Set ALLOW_IFB_REUSE=yes to force reuse." >&2
+  return 1
+}
+
+delete_ifb_device_if_safe() {
+  local ifb="$1"
+  local root_kind=""
+
+  if ! ip link show "$ifb" >/dev/null 2>&1; then
+    clear_ifb_created_state "$ifb"
+    clear_ifb_qdisc_state "$ifb"
+    return 0
+  fi
+
+  case "${ALLOW_IFB_REUSE,,}" in
+    yes|no) : ;;
+    *)
+      echo "ERROR: Invalid ALLOW_IFB_REUSE=$ALLOW_IFB_REUSE (use yes/no)." >&2
+      return 1
+      ;;
+  esac
+
+  if ! is_ifb_device "$ifb"; then
+    echo "WARN: '$ifb' exists but is not an ifb device; skipping IFB device delete." >&2
+    return 1
+  fi
+
+  if ! ifb_is_marked_as_created "$ifb"; then
+    echo "INFO: '$ifb' is not marked as created by this script; skipping IFB device delete." >&2
+    return 0
+  fi
+
+  root_kind="$(ifb_root_qdisc_kind "$ifb")"
+  if [[ -z "$root_kind" ]]; then
+    echo "ERROR: Cannot determine root qdisc kind on IFB '$ifb'; refusing to delete device." >&2
+    return 1
+  fi
+
+  if [[ "$root_kind" != "noqueue" ]]; then
+    if [[ "${ALLOW_IFB_REUSE,,}" == "yes" ]]; then
+      echo "WARN: Deleting IFB '$ifb' with root qdisc '$root_kind' because ALLOW_IFB_REUSE=yes." >&2
+    else
+      echo "ERROR: IFB '$ifb' has root qdisc '$root_kind'; refusing device delete without ALLOW_IFB_REUSE=yes." >&2
+      return 1
+    fi
+  fi
+
+  ip link set "$ifb" down 2>/dev/null || true
+  ip link del "$ifb" 2>/dev/null || true
+
+  if ip link show "$ifb" >/dev/null 2>&1; then
+    echo "ERROR: Failed to delete IFB device '$ifb'." >&2
+    return 1
+  fi
+
+  clear_ifb_created_state "$ifb"
+  clear_ifb_qdisc_state "$ifb"
+}
+
 delete_ingress_redirect_filters() {
   local wan="$1"
 
@@ -110,8 +386,11 @@ add_ingress_redirect_filters() {
   local wan="$1"
   local ifb="$2"
 
-  tc filter add dev "$wan" parent ffff: pref "$INGRESS_PREF" protocol ip u32 match u32 0 0 \
-    action mirred egress redirect dev "$ifb"
+  if ! tc filter add dev "$wan" parent ffff: pref "$INGRESS_PREF" protocol ip u32 match u32 0 0 \
+    action mirred egress redirect dev "$ifb"; then
+    echo "ERROR: Failed to install IPv4 ingress redirect filter on '$wan'." >&2
+    return 1
+  fi
 
   # 某些最小化内核/配置可能不支持 IPv6 过滤器；失败时降级为仅 IPv4。
   if ! tc filter add dev "$wan" parent ffff: pref "$INGRESS_PREF" protocol ipv6 u32 match u32 0 0 \
@@ -125,6 +404,174 @@ preflight_runtime_cmds() {
   require_cmd_or_exit tc
   require_cmd_or_exit awk
   require_cmd_or_exit grep
+}
+
+wan_if_state_file() {
+  echo "$OFFLOAD_STATE_DIR/wan-if.state"
+}
+
+save_wan_if_state() {
+  local dev="$1"
+  local state_file=""
+  local tmp_file=""
+
+  state_file="$(wan_if_state_file)"
+  if ! mkdir -p "$OFFLOAD_STATE_DIR" 2>/dev/null; then
+    echo "WARN: Failed to create state directory '$OFFLOAD_STATE_DIR'; WAN_IF pinning is disabled." >&2
+    return 1
+  fi
+
+  tmp_file="${state_file}.tmp.$$"
+  if printf '%s\n' "$dev" >"$tmp_file" 2>/dev/null && \
+    mv -f "$tmp_file" "$state_file" 2>/dev/null; then
+    return 0
+  fi
+
+  rm -f "$tmp_file" 2>/dev/null || true
+  echo "WARN: Failed to save WAN_IF state to '$state_file'." >&2
+  return 1
+}
+
+load_wan_if_state() {
+  local state_file=""
+  local dev=""
+
+  state_file="$(wan_if_state_file)"
+  [[ -r "$state_file" ]] || return 1
+
+  dev="$(awk 'NR==1 {print; exit}' "$state_file" 2>/dev/null || true)"
+  dev="${dev%$'\r'}"
+  if [[ -z "$dev" ]]; then
+    rm -f "$state_file" 2>/dev/null || true
+    return 1
+  fi
+
+  if ! ip link show "$dev" >/dev/null 2>&1; then
+    echo "WARN: Stored WAN_IF '$dev' is unavailable; keeping pinned WAN_IF for deterministic cleanup targeting." >&2
+  fi
+
+  echo "$dev"
+}
+
+resolve_control_wan_if() {
+  local provided="$1"
+  local pinned=""
+  local root_owned=""
+  local detected=""
+
+  pinned="$(load_wan_if_state || true)"
+  root_owned="$(load_root_cake_state || true)"
+
+  if [[ -n "$provided" ]]; then
+    if [[ -n "$pinned" && "$provided" != "$pinned" ]]; then
+      if ip link show "$pinned" >/dev/null 2>&1; then
+        echo "WARN: Provided WAN_IF '$provided' differs from pinned WAN_IF '$pinned'; using pinned WAN_IF." >&2
+        echo "$pinned"
+        return 0
+      fi
+      if [[ -n "$root_owned" && "$provided" != "$root_owned" ]] && ip link show "$root_owned" >/dev/null 2>&1; then
+        echo "WARN: Pinned WAN_IF '$pinned' is unavailable; provided WAN_IF '$provided' differs from root-owned WAN_IF '$root_owned', using root-owned WAN_IF." >&2
+        echo "$root_owned"
+        return 0
+      fi
+      echo "WARN: Pinned WAN_IF '$pinned' is unavailable; honoring provided WAN_IF '$provided'." >&2
+      echo "$provided"
+      return 0
+    fi
+    if [[ -z "$pinned" && -n "$root_owned" && "$provided" != "$root_owned" ]]; then
+      if ip link show "$root_owned" >/dev/null 2>&1; then
+        echo "WARN: Provided WAN_IF '$provided' differs from root-owned WAN_IF '$root_owned'; using root-owned WAN_IF." >&2
+        echo "$root_owned"
+        return 0
+      fi
+      echo "WARN: Root-owned WAN_IF '$root_owned' is unavailable; honoring provided WAN_IF '$provided'." >&2
+      echo "$provided"
+      return 0
+    fi
+    echo "$provided"
+    return 0
+  fi
+
+  if [[ -n "$pinned" ]]; then
+    if ip link show "$pinned" >/dev/null 2>&1; then
+      echo "$pinned"
+      return 0
+    fi
+    if [[ -n "$root_owned" ]] && ip link show "$root_owned" >/dev/null 2>&1; then
+      echo "WARN: Pinned WAN_IF '$pinned' is unavailable; using root-owned WAN_IF '$root_owned'." >&2
+      echo "$root_owned"
+      return 0
+    fi
+    echo "$pinned"
+    return 0
+  fi
+
+  if [[ -n "$root_owned" ]]; then
+    echo "$root_owned"
+    return 0
+  fi
+
+  detected="$(detect_wan_if || true)"
+  [[ -n "$detected" ]] && echo "$detected"
+}
+
+clear_wan_if_state() {
+  local state_file=""
+  state_file="$(wan_if_state_file)"
+  rm -f "$state_file" 2>/dev/null || true
+}
+
+root_cake_state_file() {
+  echo "$OFFLOAD_STATE_DIR/root-cake.state"
+}
+
+save_root_cake_state() {
+  local dev="$1"
+  local state_file=""
+  local tmp_file=""
+
+  state_file="$(root_cake_state_file)"
+  if ! mkdir -p "$OFFLOAD_STATE_DIR" 2>/dev/null; then
+    echo "WARN: Failed to create state directory '$OFFLOAD_STATE_DIR'; root-cake ownership pinning is disabled." >&2
+    return 1
+  fi
+
+  tmp_file="${state_file}.tmp.$$"
+  if printf '%s\n' "$dev" >"$tmp_file" 2>/dev/null && \
+    mv -f "$tmp_file" "$state_file" 2>/dev/null; then
+    return 0
+  fi
+
+  rm -f "$tmp_file" 2>/dev/null || true
+  echo "WARN: Failed to save root-cake state to '$state_file'." >&2
+  return 1
+}
+
+load_root_cake_state() {
+  local state_file=""
+  local dev=""
+
+  state_file="$(root_cake_state_file)"
+  [[ -r "$state_file" ]] || return 1
+
+  dev="$(awk 'NR==1 {print; exit}' "$state_file" 2>/dev/null || true)"
+  dev="${dev%$'\r'}"
+  if [[ -z "$dev" ]]; then
+    rm -f "$state_file" 2>/dev/null || true
+    return 1
+  fi
+
+  if ! ip link show "$dev" >/dev/null 2>&1; then
+    echo "WARN: Stored root-cake interface '$dev' is unavailable; keeping marker for deterministic cleanup targeting." >&2
+  fi
+
+  echo "$dev"
+}
+
+clear_root_cake_state() {
+  local state_file=""
+  state_file="$(root_cake_state_file)"
+  rm -f "$state_file" 2>/dev/null || true
 }
 
 offload_state_file() {
@@ -237,20 +684,60 @@ restore_offload_if_needed() {
   rm -f "$state_file" 2>/dev/null || true
 }
 
-remove_wan_cake_root_if_present() {
+has_root_cake_qdisc() {
   local dev="$1"
 
-  if ! tc qdisc show dev "$dev" 2>/dev/null | grep -qE '\bqdisc[[:space:]]+cake\b.*\broot\b'; then
+  tc qdisc show dev "$dev" 2>/dev/null | grep -qE '\bqdisc[[:space:]]+cake\b.*\broot\b'
+}
+
+remove_wan_cake_root_if_owned() {
+  local dev="$1"
+  local owner=""
+
+  owner="$(load_root_cake_state || true)"
+  if [[ -n "$owner" && "$owner" != "$dev" ]]; then
+    if ip link show "$owner" >/dev/null 2>&1 && has_root_cake_qdisc "$owner"; then
+      echo "WARN: Root CAKE marker points to '$owner' (current: '$dev') and '$owner' still has root CAKE; refusing to delete." >&2
+      return 1
+    fi
+    echo "WARN: Root CAKE marker points to stale/unavailable '$owner'; allowing cleanup on '$dev' and clearing stale marker." >&2
+    clear_root_cake_state
+    owner=""
+  fi
+
+  if ! has_root_cake_qdisc "$dev"; then
     echo "INFO: Root qdisc on '$dev' is not cake, skipping root qdisc delete." >&2
+    if [[ "$owner" == "$dev" ]]; then
+      clear_root_cake_state
+    fi
     return 0
+  fi
+
+  if [[ -z "$owner" ]]; then
+    case "${ALLOW_UNOWNED_WAN_CAKE_DELETE,,}" in
+      yes)
+        echo "WARN: Root CAKE on '$dev' has no ownership marker; deleting due to ALLOW_UNOWNED_WAN_CAKE_DELETE=yes." >&2
+        ;;
+      no)
+        echo "ERROR: Root CAKE on '$dev' has no ownership marker; refusing to delete." >&2
+        echo "ERROR: Set ALLOW_UNOWNED_WAN_CAKE_DELETE=yes to allow legacy/unowned cleanup." >&2
+        return 1
+        ;;
+      *)
+        echo "ERROR: Invalid ALLOW_UNOWNED_WAN_CAKE_DELETE=$ALLOW_UNOWNED_WAN_CAKE_DELETE (use yes/no)." >&2
+        return 1
+        ;;
+    esac
   fi
 
   tc qdisc del dev "$dev" root 2>/dev/null || true
 
-  if tc qdisc show dev "$dev" 2>/dev/null | grep -qE '\bqdisc[[:space:]]+cake\b.*\broot\b'; then
+  if has_root_cake_qdisc "$dev"; then
     echo "ERROR: Failed to remove CAKE root qdisc on '$dev'." >&2
     return 1
   fi
+
+  clear_root_cake_state
 }
 
 apply_egress() {
@@ -260,7 +747,10 @@ apply_egress() {
   warn_virt_limits
   modprobe sch_cake 2>/dev/null || true
 
-  require_if_exists_or_exit "$dev"
+  if ! ip link show "$dev" >/dev/null 2>&1; then
+    echo "ERROR: Interface '$dev' does not exist." >&2
+    return 1
+  fi
 
   local opts=()
   opts+=(bandwidth "$UP_BW")
@@ -273,7 +763,7 @@ apply_egress() {
     yes)  opts+=(nat) ;;
     no)   : ;;
     auto) nf="$(nat_flag_auto)"; [[ -n "$nf" ]] && opts+=("$nf") ;;
-    *)    echo "Invalid NAT=$NAT (use auto/yes/no)" >&2; exit 1 ;;
+    *)    echo "Invalid NAT=$NAT (use auto/yes/no)" >&2; return 1 ;;
   esac
 
   # RTT（可选）
@@ -299,14 +789,30 @@ apply_egress() {
 
 ensure_ifb_device() {
   local ifb="$1"
+  local created_new=0
 
   warn_virt_limits
   modprobe ifb 2>/dev/null || true
 
-  if ! ip link show "$ifb" >/dev/null 2>&1; then
+  if ip link show "$ifb" >/dev/null 2>&1; then
+    if ! is_ifb_device "$ifb"; then
+      echo "ERROR: Interface '$ifb' exists but is not an ifb device." >&2
+      return 1
+    fi
+  else
     ip link add "$ifb" type ifb
+    created_new=1
   fi
   ip link set "$ifb" up
+
+  if (( created_new == 1 )); then
+    if ! save_ifb_created_state "$ifb"; then
+      ip link set "$ifb" down 2>/dev/null || true
+      ip link del "$ifb" 2>/dev/null || true
+      echo "ERROR: IFB '$ifb' was created but ownership marker could not be saved; refusing to continue." >&2
+      return 1
+    fi
+  fi
 }
 
 setup_ingress_redirect() {
@@ -318,12 +824,22 @@ setup_ingress_redirect() {
   modprobe cls_u32 2>/dev/null || true
   modprobe act_mirred 2>/dev/null || true
 
-  require_if_exists_or_exit "$wan"
-  require_if_exists_or_exit "$ifb"
+  if ! ip link show "$wan" >/dev/null 2>&1; then
+    echo "ERROR: Interface '$wan' does not exist." >&2
+    return 1
+  fi
+  if ! ip link show "$ifb" >/dev/null 2>&1; then
+    echo "ERROR: Interface '$ifb' does not exist." >&2
+    return 1
+  fi
 
   # 确保 WAN 上有 ingress/clsact；避免删除他人的 ingress qdisc
   if ! tc qdisc show dev "$wan" 2>/dev/null | grep -qE '\b(ingress|clsact)\b'; then
-    tc qdisc add dev "$wan" handle ffff: ingress 2>/dev/null || tc qdisc add dev "$wan" clsact
+    if ! tc qdisc add dev "$wan" handle ffff: ingress 2>/dev/null && \
+      ! tc qdisc add dev "$wan" clsact; then
+      echo "ERROR: Failed to create ingress/clsact qdisc on '$wan'." >&2
+      return 1
+    fi
   fi
 
   # 仅清理本脚本的 filter（按固定 pref）
@@ -337,10 +853,19 @@ apply_ingress_via_ifb() {
   local ifb="$2"
   local nf=""
 
+  if [[ "$ifb" == "$wan" ]]; then
+    echo "ERROR: IFB_DEV ('$ifb') must be different from WAN_IF ('$wan')." >&2
+    return 1
+  fi
+
   # DOWN_BW 为空视为显式关闭下行整形，并清理残留（仅清理本脚本 filter）
   if [[ -z "$DOWN_BW" ]]; then
     delete_ingress_redirect_filters "$wan"
-    tc qdisc del dev "$ifb" root 2>/dev/null || true
+    if should_skip_unowned_ifb_cleanup "$ifb"; then
+      echo "INFO: IFB '$ifb' root cake is unmarked; leaving it untouched because ingress shaping is disabled." >&2
+      return 0
+    fi
+    cleanup_ifb_qdisc_if_safe "$ifb" || return 1
     return 0
   fi
 
@@ -355,7 +880,7 @@ apply_ingress_via_ifb() {
     yes)  opts+=(nat) ;;
     no)   : ;;
     auto) nf="$(nat_flag_auto)"; [[ -n "$nf" ]] && opts+=("$nf") ;;
-    *)    echo "Invalid NAT=$NAT (use auto/yes/no)" >&2; exit 1 ;;
+    *)    echo "Invalid NAT=$NAT (use auto/yes/no)" >&2; return 1 ;;
   esac
 
   [[ -n "$RTT" ]] && opts+=(rtt "$RTT")
@@ -367,22 +892,109 @@ apply_ingress_via_ifb() {
   fi
 
   # 先配置 IFB 上的 CAKE，再接入 redirect，避免短暂的无整形窗口
-  ensure_ifb_device "$ifb"
-  tc qdisc replace dev "$ifb" root cake "${opts[@]}"
-  setup_ingress_redirect "$wan" "$ifb"
+  if ! ensure_ifb_device "$ifb"; then
+    return 1
+  fi
+  if ! validate_ifb_reuse_policy "$ifb"; then
+    return 1
+  fi
+  if ! tc qdisc replace dev "$ifb" root cake "${opts[@]}"; then
+    echo "ERROR: Failed to apply CAKE root qdisc on IFB '$ifb'." >&2
+    return 1
+  fi
+  if ! save_ifb_qdisc_state "$ifb"; then
+    tc qdisc del dev "$ifb" root 2>/dev/null || true
+    echo "ERROR: Failed to persist IFB qdisc ownership marker for '$ifb'; rolling back ingress qdisc apply." >&2
+    return 1
+  fi
+  if ! setup_ingress_redirect "$wan" "$ifb"; then
+    return 1
+  fi
 }
 
 start() {
   preflight_runtime_cmds
+  local existing_wan_state=""
+  local existing_root_state=""
+  local rollback_failed=0
 
   if [[ -z "$WAN_IF" ]]; then
     WAN_IF="$(detect_wan_if || true)"
   fi
   [[ -z "$WAN_IF" ]] && { echo "Cannot detect WAN interface. Pass it as arg2." >&2; exit 1; }
+  require_if_exists_or_exit "$WAN_IF"
 
-  disable_offload_if_needed "$WAN_IF"
-  apply_egress "$WAN_IF"
-  apply_ingress_via_ifb "$WAN_IF" "$IFB_DEV"
+  existing_wan_state="$(load_wan_if_state || true)"
+  if [[ -n "$existing_wan_state" && "$existing_wan_state" != "$WAN_IF" ]]; then
+    if ip link show "$existing_wan_state" >/dev/null 2>&1; then
+      echo "ERROR: Existing WAN_IF state is pinned to '$existing_wan_state'. Stop it first, then start on '$WAN_IF'." >&2
+      exit 1
+    fi
+    echo "WARN: Existing WAN_IF state '$existing_wan_state' is unavailable; repinning to '$WAN_IF'." >&2
+    clear_wan_if_state
+  fi
+
+  existing_root_state="$(load_root_cake_state || true)"
+  if [[ -n "$existing_root_state" && "$existing_root_state" != "$WAN_IF" ]]; then
+    if ip link show "$existing_root_state" >/dev/null 2>&1; then
+      echo "ERROR: Existing root-cake ownership points to '$existing_root_state'. Stop it first, then start on '$WAN_IF'." >&2
+      exit 1
+    fi
+    echo "WARN: Existing root-cake marker '$existing_root_state' is unavailable; repinning to '$WAN_IF'." >&2
+    clear_root_cake_state
+  fi
+
+  if ! save_wan_if_state "$WAN_IF"; then
+    echo "ERROR: Failed to persist WAN_IF state; aborting to avoid cleanup targeting the wrong interface later." >&2
+    exit 1
+  fi
+  if ! save_root_cake_state "$WAN_IF"; then
+    echo "ERROR: Failed to persist root-cake ownership state; aborting to keep stop/restart deterministic." >&2
+    clear_wan_if_state
+    exit 1
+  fi
+
+  if ! disable_offload_if_needed "$WAN_IF"; then
+    echo "ERROR: Failed before applying egress; clearing pinned state." >&2
+    clear_root_cake_state
+    clear_wan_if_state
+    exit 1
+  fi
+  if ! apply_egress "$WAN_IF"; then
+    echo "ERROR: Failed to apply egress CAKE; attempting rollback." >&2
+
+    remove_wan_cake_root_if_owned "$WAN_IF" || rollback_failed=1
+    restore_offload_if_needed "$WAN_IF" || rollback_failed=1
+
+    if (( rollback_failed == 0 )); then
+      clear_wan_if_state
+      clear_root_cake_state
+    else
+      echo "WARN: Rollback after egress failure was incomplete; keeping state files for deterministic manual cleanup." >&2
+    fi
+    exit 1
+  fi
+  if ! apply_ingress_via_ifb "$WAN_IF" "$IFB_DEV"; then
+    echo "ERROR: Failed to apply ingress shaping; attempting rollback." >&2
+
+    # Best-effort rollback for partial start.
+    delete_ingress_redirect_filters "$WAN_IF"
+    if should_skip_unowned_ifb_cleanup "$IFB_DEV"; then
+      echo "INFO: IFB '$IFB_DEV' root cake is unmarked; skipping IFB rollback cleanup." >&2
+    else
+      cleanup_ifb_qdisc_if_safe "$IFB_DEV" || rollback_failed=1
+    fi
+    remove_wan_cake_root_if_owned "$WAN_IF" || rollback_failed=1
+    restore_offload_if_needed "$WAN_IF" || rollback_failed=1
+
+    if (( rollback_failed == 0 )); then
+      clear_wan_if_state
+      clear_root_cake_state
+    else
+      echo "WARN: Rollback after start failure was incomplete; keeping state files for deterministic manual cleanup." >&2
+    fi
+    exit 1
+  fi
 
   tc -s qdisc show dev "$WAN_IF" || true
   tc filter show dev "$WAN_IF" parent ffff: 2>/dev/null || true
@@ -394,40 +1006,77 @@ start() {
 stop() {
   preflight_runtime_cmds
   local stop_failed=0
+  local control_wan=""
+  local wan_cleanup_confirmed=0
+  local ifb_cleanup_ok=1
 
-  if [[ -z "$WAN_IF" ]]; then
-    WAN_IF="$(detect_wan_if || true)"
-  fi
+  control_wan="$(resolve_control_wan_if "${WAN_IF-}" || true)"
 
-  if [[ -n "$WAN_IF" ]]; then
-    remove_wan_cake_root_if_present "$WAN_IF" || stop_failed=1
-    delete_ingress_redirect_filters "$WAN_IF"
-    restore_offload_if_needed "$WAN_IF" || stop_failed=1
+  if [[ -n "$control_wan" ]]; then
+    if ! ip link show "$control_wan" >/dev/null 2>&1; then
+      echo "WARN: Resolved WAN interface '$control_wan' does not exist, skipping WAN qdisc cleanup." >&2
+      stop_failed=1
+    else
+      if remove_wan_cake_root_if_owned "$control_wan"; then
+        wan_cleanup_confirmed=1
+        delete_ingress_redirect_filters "$control_wan"
+        restore_offload_if_needed "$control_wan" || stop_failed=1
+      else
+        echo "WARN: Skipping additional WAN cleanup on '$control_wan' because root CAKE ownership cleanup failed." >&2
+        stop_failed=1
+      fi
+    fi
   else
     echo "WARN: Cannot detect WAN interface, skipping WAN qdisc cleanup." >&2
     stop_failed=1
   fi
 
   # IFB 清理（默认不删设备，避免影响其他服务）
-  tc qdisc del dev "$IFB_DEV" root 2>/dev/null || true
-  if [[ "${DELETE_IFB_ON_STOP,,}" == "yes" ]]; then
-    ip link set "$IFB_DEV" down 2>/dev/null || true
-    ip link del "$IFB_DEV" 2>/dev/null || true
+  if (( wan_cleanup_confirmed == 1 )); then
+    if [[ -n "$control_wan" && "$IFB_DEV" == "$control_wan" ]]; then
+      echo "WARN: IFB_DEV ('$IFB_DEV') matches WAN_IF; skipping IFB cleanup to avoid touching WAN root qdisc." >&2
+      stop_failed=1
+    else
+      if should_skip_unowned_ifb_cleanup "$IFB_DEV"; then
+        echo "INFO: IFB '$IFB_DEV' root cake is unmarked; skipping IFB cleanup." >&2
+      else
+        if ! cleanup_ifb_qdisc_if_safe "$IFB_DEV"; then
+          stop_failed=1
+          ifb_cleanup_ok=0
+        fi
+      fi
+      if [[ "${DELETE_IFB_ON_STOP,,}" == "yes" && "$ifb_cleanup_ok" -eq 1 ]]; then
+        delete_ifb_device_if_safe "$IFB_DEV" || stop_failed=1
+      elif [[ "${DELETE_IFB_ON_STOP,,}" == "yes" ]]; then
+        echo "WARN: Skipping IFB device delete because IFB qdisc cleanup failed." >&2
+      fi
+    fi
+  else
+    echo "WARN: Skipping IFB cleanup because WAN cleanup target was not confirmed." >&2
   fi
 
-  (( stop_failed == 0 )) || return 1
+  if (( stop_failed == 0 )); then
+    clear_wan_if_state
+    clear_root_cake_state
+    return 0
+  fi
+
+  return 1
 }
 
 status() {
   preflight_runtime_cmds
+  local control_wan=""
 
-  if [[ -z "$WAN_IF" ]]; then
-    WAN_IF="$(detect_wan_if || true)"
+  control_wan="$(resolve_control_wan_if "${WAN_IF-}" || true)"
+  [[ -z "$control_wan" ]] && { echo "Cannot detect WAN interface."; exit 1; }
+  if ! ip link show "$control_wan" >/dev/null 2>&1; then
+    echo "ERROR: Interface '$control_wan' does not exist." >&2
+    exit 1
   fi
-  [[ -z "$WAN_IF" ]] && { echo "Cannot detect WAN interface."; exit 1; }
 
-  tc -s qdisc show dev "$WAN_IF" || true
-  tc filter show dev "$WAN_IF" parent ffff: 2>/dev/null || true
+  tc -s qdisc show dev "$control_wan" || true
+  tc filter show dev "$control_wan" parent ffff: 2>/dev/null || true
   if ip link show "$IFB_DEV" >/dev/null 2>&1; then
     tc -s qdisc show dev "$IFB_DEV" || true
   fi
@@ -436,7 +1085,21 @@ status() {
 case "$CMD" in
   start)   start ;;
   stop)    stop ;;
-  restart) stop; start ;;
+  restart)
+    restart_target="$(resolve_control_wan_if "${WAN_IF-}" || true)"
+    if [[ -n "${restart_target-}" ]] && ! ip link show "$restart_target" >/dev/null 2>&1; then
+      echo "WARN: Resolved restart WAN_IF '$restart_target' does not exist; falling back to auto-detection." >&2
+      restart_target="$(detect_wan_if || true)"
+    fi
+    restart_stop_failed=0
+    if ! stop; then
+      restart_stop_failed=1
+      echo "WARN: stop failed during restart; proceeding with start." >&2
+    fi
+    WAN_IF="${restart_target-}"
+    start
+    (( restart_stop_failed == 0 )) || exit 2
+    ;;
   status)  status ;;
   *) echo "Usage: $0 {start|stop|restart|status} [WAN_IF]" >&2; exit 1 ;;
 esac
