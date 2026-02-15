@@ -387,6 +387,111 @@ delete_ingress_redirect_filters() {
   tc filter del dev "$wan" parent ffff: pref "$INGRESS_PREF" protocol ipv6 2>/dev/null || true
 }
 
+ingress_qdisc_state_file() {
+  echo "$OFFLOAD_STATE_DIR/ingress-qdisc.state"
+}
+
+save_ingress_qdisc_state() {
+  local dev="$1"
+  local state_file=""
+  local tmp_file=""
+
+  state_file="$(ingress_qdisc_state_file)"
+  if ! mkdir -p "$OFFLOAD_STATE_DIR" 2>/dev/null; then
+    echo "WARN: Failed to create state directory '$OFFLOAD_STATE_DIR'; ingress qdisc ownership marker is unavailable." >&2
+    return 1
+  fi
+
+  tmp_file="${state_file}.tmp.$$"
+  if printf '%s\n' "$dev" >"$tmp_file" 2>/dev/null && \
+    mv -f "$tmp_file" "$state_file" 2>/dev/null; then
+    return 0
+  fi
+
+  rm -f "$tmp_file" 2>/dev/null || true
+  echo "WARN: Failed to save ingress qdisc ownership marker to '$state_file'." >&2
+  return 1
+}
+
+ingress_qdisc_is_owned() {
+  local dev="$1"
+  local state_file=""
+  local owner=""
+
+  state_file="$(ingress_qdisc_state_file)"
+  [[ -r "$state_file" ]] || return 1
+
+  owner="$(awk 'NR==1 {print; exit}' "$state_file" 2>/dev/null || true)"
+  owner="${owner%$'\r'}"
+  if [[ "$owner" == "$dev" ]]; then
+    return 0
+  fi
+
+  if [[ -z "$owner" ]]; then
+    rm -f "$state_file" 2>/dev/null || true
+  fi
+  return 1
+}
+
+clear_ingress_qdisc_state() {
+  local state_file=""
+  state_file="$(ingress_qdisc_state_file)"
+  rm -f "$state_file" 2>/dev/null || true
+}
+
+remove_wan_ingress_qdisc_if_owned() {
+  local dev="$1"
+  local qdisc_dump=""
+  local filter_dump=""
+  local ingress_dump=""
+  local egress_dump=""
+
+  if ! ingress_qdisc_is_owned "$dev"; then
+    return 0
+  fi
+
+  if ! ip link show "$dev" >/dev/null 2>&1; then
+    echo "WARN: Owned ingress qdisc interface '$dev' is unavailable; keeping marker for deterministic cleanup targeting." >&2
+    return 0
+  fi
+
+  qdisc_dump="$(tc qdisc show dev "$dev" 2>/dev/null || true)"
+  if ! grep -qE '\b(ingress|clsact)\b' <<<"$qdisc_dump"; then
+    clear_ingress_qdisc_state
+    return 0
+  fi
+
+  filter_dump="$(tc filter show dev "$dev" 2>/dev/null || true)"
+  if [[ -z "${filter_dump//[[:space:]]/}" ]]; then
+    filter_dump="$(tc filter show dev "$dev" parent ffff: 2>/dev/null || true)"
+  fi
+  if [[ -z "${filter_dump//[[:space:]]/}" ]]; then
+    ingress_dump="$(tc filter show dev "$dev" ingress 2>/dev/null || true)"
+    egress_dump="$(tc filter show dev "$dev" egress 2>/dev/null || true)"
+    if [[ -n "${ingress_dump//[[:space:]]/}" || -n "${egress_dump//[[:space:]]/}" ]]; then
+      filter_dump="filters-present"
+    fi
+  fi
+  if [[ -n "${filter_dump//[[:space:]]/}" ]]; then
+    echo "INFO: Ingress/clsact qdisc on '$dev' still has filters; skipping owned qdisc delete." >&2
+    return 0
+  fi
+
+  if grep -qE '\bclsact\b' <<<"$qdisc_dump"; then
+    tc qdisc del dev "$dev" clsact 2>/dev/null || true
+  else
+    tc qdisc del dev "$dev" ingress 2>/dev/null || true
+  fi
+
+  qdisc_dump="$(tc qdisc show dev "$dev" 2>/dev/null || true)"
+  if grep -qE '\b(ingress|clsact)\b' <<<"$qdisc_dump"; then
+    echo "ERROR: Failed to remove owned ingress/clsact qdisc on '$dev'." >&2
+    return 1
+  fi
+
+  clear_ingress_qdisc_state
+}
+
 add_ingress_redirect_filters() {
   local wan="$1"
   local ifb="$2"
@@ -826,6 +931,7 @@ setup_ingress_redirect() {
   local wan="$1"
   local ifb="$2"
   local qdisc_dump=""
+  local created_qdisc_kind=""
 
   warn_virt_limits
   modprobe sch_ingress 2>/dev/null || true
@@ -844,14 +950,25 @@ setup_ingress_redirect() {
   # 确保 WAN 上有 ingress/clsact；避免删除他人的 ingress qdisc
   qdisc_dump="$(tc qdisc show dev "$wan" 2>/dev/null || true)"
   if ! grep -qE '\b(ingress|clsact)\b' <<<"$qdisc_dump"; then
-    if ! tc qdisc add dev "$wan" handle ffff: ingress 2>/dev/null && \
-      ! tc qdisc add dev "$wan" clsact; then
+    if tc qdisc add dev "$wan" handle ffff: ingress 2>/dev/null; then
+      created_qdisc_kind="ingress"
+    elif tc qdisc add dev "$wan" clsact; then
+      created_qdisc_kind="clsact"
+    else
       echo "ERROR: Failed to create ingress/clsact qdisc on '$wan'." >&2
       return 1
     fi
   fi
 
   # 仅清理本脚本的 filter（按固定 pref）
+  if [[ -n "$created_qdisc_kind" ]]; then
+    if ! save_ingress_qdisc_state "$wan"; then
+      tc qdisc del dev "$wan" "$created_qdisc_kind" 2>/dev/null || true
+      echo "ERROR: Failed to persist ingress qdisc ownership marker for '$wan'; rolling back ingress/clsact qdisc create." >&2
+      return 1
+    fi
+  fi
+
   delete_ingress_redirect_filters "$wan"
 
   add_ingress_redirect_filters "$wan" "$ifb"
@@ -870,6 +987,7 @@ apply_ingress_via_ifb() {
   # DOWN_BW 为空视为显式关闭下行整形，并清理残留（仅清理本脚本 filter）
   if [[ -z "$DOWN_BW" ]]; then
     delete_ingress_redirect_filters "$wan"
+    remove_wan_ingress_qdisc_if_owned "$wan" || return 1
     if should_skip_unowned_ifb_cleanup "$ifb"; then
       echo "INFO: IFB '$ifb' root cake is unmarked; leaving it untouched because ingress shaping is disabled." >&2
       return 0
@@ -988,6 +1106,7 @@ start() {
 
     # Best-effort rollback for partial start.
     delete_ingress_redirect_filters "$WAN_IF"
+    remove_wan_ingress_qdisc_if_owned "$WAN_IF" || rollback_failed=1
     if should_skip_unowned_ifb_cleanup "$IFB_DEV"; then
       echo "INFO: IFB '$IFB_DEV' root cake is unmarked; skipping IFB rollback cleanup." >&2
     else
@@ -1029,6 +1148,7 @@ stop() {
       if remove_wan_cake_root_if_owned "$control_wan"; then
         wan_cleanup_confirmed=1
         delete_ingress_redirect_filters "$control_wan"
+        remove_wan_ingress_qdisc_if_owned "$control_wan" || stop_failed=1
         restore_offload_if_needed "$control_wan" || stop_failed=1
       else
         echo "WARN: Skipping additional WAN cleanup on '$control_wan' because root CAKE ownership cleanup failed." >&2
