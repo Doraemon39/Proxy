@@ -66,15 +66,19 @@ detect_wan_if() {
 
 nat_flag_auto() {
   # 检测系统是否有 NAT（MASQUERADE/masquerade）规则：nftables 或 iptables
+  local nft_ruleset=""
+  local ipt_rules=""
   if command -v nft >/dev/null 2>&1; then
-    if nft list ruleset 2>/dev/null | grep -qiE '\bmasquerade\b'; then
+    nft_ruleset="$(nft list ruleset 2>/dev/null || true)"
+    if grep -qiE '\bmasquerade\b' <<<"$nft_ruleset"; then
       echo "nat"
       return 0
     fi
   fi
 
   if command -v iptables >/dev/null 2>&1; then
-    if iptables -t nat -S 2>/dev/null | grep -qiE '\bMASQUERADE\b'; then
+    ipt_rules="$(iptables -t nat -S 2>/dev/null || true)"
+    if grep -qiE '\bMASQUERADE\b' <<<"$ipt_rules"; then
       echo "nat"
       return 0
     fi
@@ -101,10 +105,11 @@ require_cmd_or_exit() {
 
 is_ifb_device() {
   local dev="$1"
+  local ifb_names=""
 
-  ip -o link show type ifb 2>/dev/null | \
-    awk -F': ' '{name=$2; sub(/@.*/, "", name); print name}' | \
-    grep -Fxq "$dev"
+  ifb_names="$(ip -o link show type ifb 2>/dev/null | \
+    awk -F': ' '{name=$2; sub(/@.*/, "", name); print name}' || true)"
+  grep -Fxq "$dev" <<<"$ifb_names"
 }
 
 ifb_created_state_file() {
@@ -686,8 +691,10 @@ restore_offload_if_needed() {
 
 has_root_cake_qdisc() {
   local dev="$1"
+  local qdisc_dump=""
 
-  tc qdisc show dev "$dev" 2>/dev/null | grep -qE '\bqdisc[[:space:]]+cake\b.*\broot\b'
+  qdisc_dump="$(tc qdisc show dev "$dev" 2>/dev/null || true)"
+  grep -qE '\bqdisc[[:space:]]+cake\b.*\broot\b' <<<"$qdisc_dump"
 }
 
 remove_wan_cake_root_if_owned() {
@@ -818,6 +825,7 @@ ensure_ifb_device() {
 setup_ingress_redirect() {
   local wan="$1"
   local ifb="$2"
+  local qdisc_dump=""
 
   warn_virt_limits
   modprobe sch_ingress 2>/dev/null || true
@@ -834,7 +842,8 @@ setup_ingress_redirect() {
   fi
 
   # 确保 WAN 上有 ingress/clsact；避免删除他人的 ingress qdisc
-  if ! tc qdisc show dev "$wan" 2>/dev/null | grep -qE '\b(ingress|clsact)\b'; then
+  qdisc_dump="$(tc qdisc show dev "$wan" 2>/dev/null || true)"
+  if ! grep -qE '\b(ingress|clsact)\b' <<<"$qdisc_dump"; then
     if ! tc qdisc add dev "$wan" handle ffff: ingress 2>/dev/null && \
       ! tc qdisc add dev "$wan" clsact; then
       echo "ERROR: Failed to create ingress/clsact qdisc on '$wan'." >&2
