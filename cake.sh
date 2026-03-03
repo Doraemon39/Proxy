@@ -14,31 +14,36 @@ if [[ -r "$CFG" ]]; then
   source "$CFG"
 fi
 
-# ===== 默认值 =====
-UP_BW="${UP_BW:-20mbit}"                # 必填：空则给默认
-MODE="${MODE-"triple-isolate"}"         # 允许空值（用 - 而不是 :-）
-DIFFSERV="${DIFFSERV-"diffserv4"}"      # 允许 DIFFSERV="" 来禁用
+# ===== Defaults =====
+UP_BW="${UP_BW:-20mbit}"                # Required; default if unset.
+MODE="${MODE-"triple-isolate"}"         # Use "-" expansion to allow empty value.
+DIFFSERV="${DIFFSERV-"diffserv4"}"      # Allow DIFFSERV="" to disable DiffServ mode.
 NAT="${NAT:-no}"
 ACK_FILTER="${ACK_FILTER:-yes}"
-RTT="${RTT-}"                           # 允许空
-DOWN_BW="${DOWN_BW-}"                   # 允许空（默认关闭下行整形）
+RTT="${RTT-}"                           # Optional.
+DOWN_BW="${DOWN_BW-}"                   # Optional; empty disables ingress shaping.
 IFB_DEV="${IFB_DEV:-ifb0}"
 EXTRA_CAKE_OPTS="${EXTRA_CAKE_OPTS-}"
-DISABLE_OFFLOAD="${DISABLE_OFFLOAD:-yes}"  # yes/no；默认关闭 WAN 口 tso/gso/gro
-DELETE_IFB_ON_STOP="${DELETE_IFB_ON_STOP:-no}"  # yes/no；yes 时 stop 会删除 IFB 设备
-ALLOW_IFB_REUSE="${ALLOW_IFB_REUSE:-no}"        # yes/no；yes 时允许覆盖非本脚本标记的 IFB root qdisc
-ALLOW_UNOWNED_WAN_CAKE_DELETE="${ALLOW_UNOWNED_WAN_CAKE_DELETE:-no}"  # yes/no；yes 时允许删除无 ownership marker 的 WAN root cake
-INGRESS_PREF="${INGRESS_PREF:-49152}"           # 用固定 pref 标记本脚本创建的 ingress filter
-OFFLOAD_STATE_DIR="${OFFLOAD_STATE_DIR:-/run/qos-cake}"  # offload 状态文件目录
+DISABLE_OFFLOAD="${DISABLE_OFFLOAD:-yes}"  # yes/no; default yes, disable WAN tso/gso/gro.
+DELETE_IFB_ON_STOP="${DELETE_IFB_ON_STOP:-no}"  # yes/no; delete IFB device on stop when yes.
+ALLOW_IFB_REUSE="${ALLOW_IFB_REUSE:-no}"        # yes/no; allow reusing non-owned IFB root qdisc.
+ALLOW_UNOWNED_WAN_CAKE_DELETE="${ALLOW_UNOWNED_WAN_CAKE_DELETE:-no}"  # yes/no; allow deleting unowned WAN root CAKE.
+INGRESS_PREF="${INGRESS_PREF:-49152}"           # Fixed pref used by this script's ingress filters.
+OFFLOAD_STATE_DIR="${OFFLOAD_STATE_DIR:-/run/qos-cake}"  # Directory for runtime state files.
+
+LOCK_FILE="${LOCK_FILE:-$OFFLOAD_STATE_DIR/qos-cake.lock}"
+LOCK_PID_FILE="${LOCK_PID_FILE:-$OFFLOAD_STATE_DIR/qos-cake.lock.pid}"
 
 CMD="${1:-}"
 WAN_IF="${WAN_IF-}"
 if [[ -n "${2:-}" ]]; then
   WAN_IF="$2"
 fi
+GLOBAL_LOCK_HELD=0
+GLOBAL_LOCK_KIND="none"
 
 warn_virt_limits() {
-  # LXC/OpenVZ 常见限制：无法 modprobe / 无法创建 IFB
+  # Common LXC/OpenVZ limitation: modprobe or IFB creation may be blocked.
   if command -v systemd-detect-virt >/dev/null 2>&1; then
     local virt
     virt="$(systemd-detect-virt -c 2>/dev/null || true)"
@@ -51,7 +56,7 @@ warn_virt_limits() {
 }
 
 detect_wan_if() {
-  # IPv4 优先，命中即返回；失败再尝试 IPv6
+  # Prefer IPv4 route lookup, then fall back to IPv6.
   local dev=""
 
   dev="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)"
@@ -65,7 +70,7 @@ detect_wan_if() {
 }
 
 nat_flag_auto() {
-  # 检测系统是否有 NAT（MASQUERADE/masquerade）规则：nftables 或 iptables
+  # Detect NAT rules (MASQUERADE/masquerade) via nftables or iptables.
   local nft_ruleset=""
   local ipt_rules=""
   if command -v nft >/dev/null 2>&1; then
@@ -423,10 +428,22 @@ delete_ifb_device_if_safe() {
 delete_ingress_redirect_filters() {
   local wan="$1"
 
-  # 兼容旧版本脚本遗留的 protocol all 规则
+  # Also remove legacy protocol-all rule from older script versions.
   tc filter del dev "$wan" parent ffff: pref "$INGRESS_PREF" protocol all 2>/dev/null || true
   tc filter del dev "$wan" parent ffff: pref "$INGRESS_PREF" protocol ip 2>/dev/null || true
   tc filter del dev "$wan" parent ffff: pref "$INGRESS_PREF" protocol ipv6 2>/dev/null || true
+}
+
+has_script_ingress_redirect_filters() {
+  local wan="$1"
+  local filter_dump=""
+
+  filter_dump="$(tc filter show dev "$wan" parent ffff: 2>/dev/null || true)"
+  if [[ -z "${filter_dump//[[:space:]]/}" ]]; then
+    filter_dump="$(tc filter show dev "$wan" ingress 2>/dev/null || true)"
+  fi
+
+  grep -qE "(^|[[:space:]])pref[[:space:]]+$INGRESS_PREF([[:space:]]|$)" <<<"$filter_dump"
 }
 
 ingress_qdisc_state_file() {
@@ -544,7 +561,7 @@ add_ingress_redirect_filters() {
     return 1
   fi
 
-  # 某些最小化内核/配置可能不支持 IPv6 过滤器；失败时降级为仅 IPv4。
+  # Some minimal kernels may not support IPv6 filters; keep IPv4 path working.
   if ! tc filter add dev "$wan" parent ffff: pref "$INGRESS_PREF" protocol ipv6 u32 match u32 0 0 \
     action mirred egress redirect dev "$ifb"; then
     echo "WARN: Failed to install IPv6 ingress redirect filter on '$wan'; IPv6 ingress shaping is disabled." >&2
@@ -556,6 +573,72 @@ preflight_runtime_cmds() {
   require_cmd_or_exit tc
   require_cmd_or_exit awk
   require_cmd_or_exit grep
+}
+
+release_global_lock() {
+  (( GLOBAL_LOCK_HELD == 1 )) || return 0
+
+  case "$GLOBAL_LOCK_KIND" in
+    flock)
+      flock -u 9 2>/dev/null || true
+      exec 9>&- 2>/dev/null || true
+      ;;
+    pidfile)
+      rm -f "$LOCK_PID_FILE" 2>/dev/null || true
+      ;;
+  esac
+
+  GLOBAL_LOCK_HELD=0
+  GLOBAL_LOCK_KIND="none"
+}
+
+acquire_global_lock_or_exit() {
+  (( GLOBAL_LOCK_HELD == 1 )) && return 0
+  local owner_pid=""
+
+  if ! mkdir -p "$OFFLOAD_STATE_DIR" 2>/dev/null; then
+    echo "ERROR: Failed to create state directory '$OFFLOAD_STATE_DIR'; cannot acquire global lock." >&2
+    exit 1
+  fi
+
+  if command -v flock >/dev/null 2>&1; then
+    if ! exec 9>"$LOCK_FILE"; then
+      echo "ERROR: Failed to open lock file '$LOCK_FILE'." >&2
+      exit 1
+    fi
+    if ! flock -n 9; then
+      echo "ERROR: Another qos-cake operation is in progress; wait for it to finish and retry." >&2
+      exit 1
+    fi
+    GLOBAL_LOCK_HELD=1
+    GLOBAL_LOCK_KIND="flock"
+    return 0
+  fi
+
+  if (set -o noclobber; printf '%s\n' "$$" >"$LOCK_PID_FILE") 2>/dev/null; then
+    GLOBAL_LOCK_HELD=1
+    GLOBAL_LOCK_KIND="pidfile"
+    return 0
+  fi
+
+  owner_pid="$(awk 'NR==1 {print; exit}' "$LOCK_PID_FILE" 2>/dev/null || true)"
+  owner_pid="${owner_pid%$'\r'}"
+  if [[ "$owner_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
+    rm -f "$LOCK_PID_FILE" 2>/dev/null || true
+    if (set -o noclobber; printf '%s\n' "$$" >"$LOCK_PID_FILE") 2>/dev/null; then
+      GLOBAL_LOCK_HELD=1
+      GLOBAL_LOCK_KIND="pidfile"
+      return 0
+    fi
+  fi
+
+  if [[ "$owner_pid" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: Another qos-cake operation is in progress (pid $owner_pid); wait for it to finish and retry." >&2
+    exit 1
+  fi
+
+  echo "ERROR: Another qos-cake operation is in progress; wait for it to finish and retry." >&2
+  exit 1
 }
 
 wan_if_state_file() {
@@ -726,6 +809,44 @@ clear_root_cake_state() {
   rm -f "$state_file" 2>/dev/null || true
 }
 
+root_cake_signature() {
+  local dev="$1"
+  local sig=""
+
+  sig="$(tc qdisc show dev "$dev" 2>/dev/null | \
+    awk '$2=="cake" && $4=="root" {
+      start=5
+      if ($5=="refcnt" && $6 ~ /^[0-9]+$/) {
+        start=7
+      }
+      out=""
+      for (i=start; i<=NF; i++) {
+        out = out (out=="" ? "" : " ") $i
+      }
+      print out
+      exit
+    }' || true)"
+
+  echo "$sig"
+}
+
+ensure_preexisting_root_cake_unchanged_after_rollback() {
+  local dev="$1"
+  local had_root_cake_before="$2"
+  local before_sig="$3"
+  local after_sig=""
+
+  (( had_root_cake_before == 1 )) || return 0
+
+  after_sig="$(root_cake_signature "$dev")"
+  if [[ -n "$before_sig" && -n "$after_sig" && "$after_sig" == "$before_sig" ]]; then
+    return 0
+  fi
+
+  echo "WARN: '$dev' had pre-existing root CAKE; original CAKE parameters were not confirmed after rollback. Keeping state files for deterministic manual cleanup." >&2
+  return 1
+}
+
 offload_state_file() {
   local dev="$1"
   local safe="$dev"
@@ -793,7 +914,7 @@ disable_offload_if_needed() {
     return 0
   fi
 
-  # CAKE 整形前关闭网卡常见 offload，避免限速不准
+  # Disable NIC offload before CAKE to avoid inaccurate shaping.
   if ! ethtool -K "$dev" tso off gso off gro off >/dev/null 2>&1; then
     echo "WARN: Failed to disable tso/gso/gro on '$dev'; shaping accuracy may degrade." >&2
   fi
@@ -910,6 +1031,60 @@ remove_wan_cake_root_if_owned() {
   clear_root_cake_state
 }
 
+rollback_new_wan_cake_root_if_needed() {
+  local dev="$1"
+  local had_root_cake_before="$2"
+  local before_sig="${3-}"
+  local before_opts=()
+  local current_sig=""
+  local post_kind=""
+  local default_kind=""
+
+  if (( had_root_cake_before == 1 )); then
+    current_sig="$(root_cake_signature "$dev")"
+    if [[ -n "$before_sig" && -n "$current_sig" && "$current_sig" == "$before_sig" ]]; then
+      return 0
+    fi
+
+    if [[ -z "$before_sig" ]]; then
+      echo "WARN: Failed to roll back root CAKE on '$dev' to pre-existing parameters: original signature is unavailable." >&2
+      return 1
+    fi
+
+    read -r -a before_opts <<<"$before_sig"
+    if ! tc qdisc replace dev "$dev" root cake "${before_opts[@]}"; then
+      echo "WARN: Failed to roll back root CAKE on '$dev' to pre-existing parameters." >&2
+      return 1
+    fi
+
+    current_sig="$(root_cake_signature "$dev")"
+    if [[ -n "$current_sig" && "$current_sig" == "$before_sig" ]]; then
+      return 0
+    fi
+
+    echo "WARN: Root CAKE on '$dev' was not restored to pre-existing parameters." >&2
+    return 1
+  fi
+
+  has_root_cake_qdisc "$dev" || return 0
+
+  if ! tc qdisc del dev "$dev" root 2>/dev/null; then
+    echo "WARN: Failed to roll back newly applied CAKE root qdisc on '$dev'." >&2
+    return 1
+  fi
+
+  post_kind="$(tc qdisc show dev "$dev" 2>/dev/null | awk '$4=="root" {print $2; exit}' || true)"
+  if [[ "$post_kind" == "cake" ]]; then
+    default_kind="$(kernel_default_qdisc_kind)"
+    if [[ "$default_kind" != "cake" ]]; then
+      echo "WARN: Failed to roll back newly applied CAKE root qdisc on '$dev'." >&2
+      return 1
+    fi
+  fi
+
+  return 0
+}
+
 apply_egress() {
   local dev="$1"
   local nf=""
@@ -928,7 +1103,7 @@ apply_egress() {
   [[ -n "$DIFFSERV" ]] && opts+=("$DIFFSERV")
   [[ -n "$MODE" ]] && opts+=("$MODE")
 
-  # NAT 参数
+  # NAT option
   case "$NAT" in
     yes)  opts+=(nat) ;;
     no)   : ;;
@@ -936,17 +1111,17 @@ apply_egress() {
     *)    echo "Invalid NAT=$NAT (use auto/yes/no)" >&2; return 1 ;;
   esac
 
-  # RTT（可选）
+  # Optional RTT
   [[ -n "$RTT" ]] && opts+=(rtt "$RTT")
 
-  # 额外参数（高级用法）
+  # Extra CAKE options (advanced usage)
   if [[ -n "$EXTRA_CAKE_OPTS" ]]; then
     local extra_arr=()
     read -r -a extra_arr <<< "$EXTRA_CAKE_OPTS"
     opts+=("${extra_arr[@]}")
   fi
 
-  # replace 为原子操作：存在则替换，不存在则创建
+  # Use replace for atomic add-or-update behavior.
   if [[ "${ACK_FILTER,,}" == "yes" ]]; then
     if tc qdisc replace dev "$dev" root cake "${opts[@]}" ack-filter; then
       return 0
@@ -973,13 +1148,22 @@ ensure_ifb_device() {
       return 1
     fi
   else
-    ip link add "$ifb" type ifb
+    if ! ip link add "$ifb" type ifb; then
+      echo "ERROR: Failed to create IFB device '$ifb'." >&2
+      return 1
+    fi
     created_new=1
   fi
   if ip -o link show dev "$ifb" 2>/dev/null | grep -qE '<[^>]*\bUP\b'; then
     was_up=1
   fi
-  ip link set "$ifb" up
+  if ! ip link set "$ifb" up; then
+    if (( created_new == 1 )); then
+      ip link del "$ifb" 2>/dev/null || true
+    fi
+    echo "ERROR: Failed to bring IFB '$ifb' up." >&2
+    return 1
+  fi
 
   # If IFB was down and just brought up, clear kernel auto default qdisc.
   # This avoids false "in use" detection before this script can mark ownership.
@@ -1021,7 +1205,7 @@ setup_ingress_redirect() {
     return 1
   fi
 
-  # 确保 WAN 上有 ingress/clsact；避免删除他人的 ingress qdisc
+  # Ensure ingress/clsact exists before managing redirect filters.
   qdisc_dump="$(tc qdisc show dev "$wan" 2>/dev/null || true)"
   if ! grep -qE '\b(ingress|clsact)\b' <<<"$qdisc_dump"; then
     if tc qdisc add dev "$wan" handle ffff: ingress 2>/dev/null; then
@@ -1034,7 +1218,7 @@ setup_ingress_redirect() {
     fi
   fi
 
-  # 仅清理本脚本的 filter（按固定 pref）
+  # Only clean filters owned by this script (matched by fixed pref).
   if [[ -n "$created_qdisc_kind" ]]; then
     if ! save_ingress_qdisc_state "$wan"; then
       tc qdisc del dev "$wan" "$created_qdisc_kind" 2>/dev/null || true
@@ -1058,9 +1242,13 @@ apply_ingress_via_ifb() {
     return 1
   fi
 
-  # DOWN_BW 为空视为显式关闭下行整形，并清理残留（仅清理本脚本 filter）
+  # Empty DOWN_BW means explicit ingress disable; clean residual state.
   if [[ -z "$DOWN_BW" ]]; then
     delete_ingress_redirect_filters "$wan"
+    if has_script_ingress_redirect_filters "$wan"; then
+      echo "ERROR: Ingress redirect filters on '$wan' remain after delete attempt." >&2
+      return 1
+    fi
     remove_wan_ingress_qdisc_if_owned "$wan" || return 1
     if should_skip_unowned_ifb_cleanup "$ifb"; then
       echo "INFO: IFB '$ifb' root cake is unmarked; leaving it untouched because ingress shaping is disabled." >&2
@@ -1076,7 +1264,7 @@ apply_ingress_via_ifb() {
   [[ -n "$DIFFSERV" ]] && opts+=("$DIFFSERV")
   [[ -n "$MODE" ]] && opts+=("$MODE")
 
-  # 下行整形也可能需要 nat（仅当你是 NAT 网关）
+  # Ingress shaping may also need nat when this host acts as NAT gateway.
   case "$NAT" in
     yes)  opts+=(nat) ;;
     no)   : ;;
@@ -1092,7 +1280,7 @@ apply_ingress_via_ifb() {
     opts+=("${extra_arr[@]}")
   fi
 
-  # 先配置 IFB 上的 CAKE，再接入 redirect，避免短暂的无整形窗口
+  # Apply CAKE on IFB first, then attach redirect to avoid unshaped window.
   if ! ensure_ifb_device "$ifb"; then
     return 1
   fi
@@ -1118,6 +1306,8 @@ start() {
   local existing_wan_state=""
   local existing_root_state=""
   local rollback_failed=0
+  local had_root_cake_before=0
+  local root_cake_signature_before=""
 
   if [[ -z "$WAN_IF" ]]; then
     WAN_IF="$(detect_wan_if || true)"
@@ -1149,11 +1339,6 @@ start() {
     echo "ERROR: Failed to persist WAN_IF state; aborting to avoid cleanup targeting the wrong interface later." >&2
     exit 1
   fi
-  if ! save_root_cake_state "$WAN_IF"; then
-    echo "ERROR: Failed to persist root-cake ownership state; aborting to keep stop/restart deterministic." >&2
-    clear_wan_if_state
-    exit 1
-  fi
 
   if ! disable_offload_if_needed "$WAN_IF"; then
     echo "ERROR: Failed before applying egress; clearing pinned state." >&2
@@ -1161,11 +1346,19 @@ start() {
     clear_wan_if_state
     exit 1
   fi
+  if has_root_cake_qdisc "$WAN_IF"; then
+    had_root_cake_before=1
+    root_cake_signature_before="$(root_cake_signature "$WAN_IF")"
+    if [[ -z "$root_cake_signature_before" ]]; then
+      echo "WARN: Failed to snapshot pre-existing root CAKE signature on '$WAN_IF'; rollback will be conservative." >&2
+    fi
+  fi
   if ! apply_egress "$WAN_IF"; then
     echo "ERROR: Failed to apply egress CAKE; attempting rollback." >&2
 
-    remove_wan_cake_root_if_owned "$WAN_IF" || rollback_failed=1
+    rollback_new_wan_cake_root_if_needed "$WAN_IF" "$had_root_cake_before" "$root_cake_signature_before" || rollback_failed=1
     restore_offload_if_needed "$WAN_IF" || rollback_failed=1
+    ensure_preexisting_root_cake_unchanged_after_rollback "$WAN_IF" "$had_root_cake_before" "$root_cake_signature_before" || rollback_failed=1
 
     if (( rollback_failed == 0 )); then
       clear_wan_if_state
@@ -1175,19 +1368,39 @@ start() {
     fi
     exit 1
   fi
+  if ! save_root_cake_state "$WAN_IF"; then
+    echo "ERROR: Failed to persist root-cake ownership state after egress apply; attempting rollback." >&2
+
+    rollback_new_wan_cake_root_if_needed "$WAN_IF" "$had_root_cake_before" "$root_cake_signature_before" || rollback_failed=1
+    restore_offload_if_needed "$WAN_IF" || rollback_failed=1
+    ensure_preexisting_root_cake_unchanged_after_rollback "$WAN_IF" "$had_root_cake_before" "$root_cake_signature_before" || rollback_failed=1
+
+    if (( rollback_failed == 0 )); then
+      clear_wan_if_state
+      clear_root_cake_state
+    else
+      echo "WARN: Rollback after root-cake state persistence failure was incomplete; keeping state files for deterministic manual cleanup." >&2
+    fi
+    exit 1
+  fi
   if ! apply_ingress_via_ifb "$WAN_IF" "$IFB_DEV"; then
     echo "ERROR: Failed to apply ingress shaping; attempting rollback." >&2
 
     # Best-effort rollback for partial start.
     delete_ingress_redirect_filters "$WAN_IF"
+    if has_script_ingress_redirect_filters "$WAN_IF"; then
+      echo "WARN: Ingress redirect filters on '$WAN_IF' remain after rollback delete attempt." >&2
+      rollback_failed=1
+    fi
     remove_wan_ingress_qdisc_if_owned "$WAN_IF" || rollback_failed=1
     if should_skip_unowned_ifb_cleanup "$IFB_DEV"; then
       echo "INFO: IFB '$IFB_DEV' root cake is unmarked; skipping IFB rollback cleanup." >&2
     else
       cleanup_ifb_qdisc_if_safe "$IFB_DEV" || rollback_failed=1
     fi
-    remove_wan_cake_root_if_owned "$WAN_IF" || rollback_failed=1
+    rollback_new_wan_cake_root_if_needed "$WAN_IF" "$had_root_cake_before" "$root_cake_signature_before" || rollback_failed=1
     restore_offload_if_needed "$WAN_IF" || rollback_failed=1
+    ensure_preexisting_root_cake_unchanged_after_rollback "$WAN_IF" "$had_root_cake_before" "$root_cake_signature_before" || rollback_failed=1
 
     if (( rollback_failed == 0 )); then
       clear_wan_if_state
@@ -1210,6 +1423,7 @@ stop() {
   local stop_failed=0
   local control_wan=""
   local wan_cleanup_confirmed=0
+  local wan_cleanup_complete=0
   local ifb_cleanup_ok=1
 
   control_wan="$(resolve_control_wan_if "${WAN_IF-}" || true)"
@@ -1219,23 +1433,32 @@ stop() {
       echo "WARN: Resolved WAN interface '$control_wan' does not exist, skipping WAN qdisc cleanup." >&2
       stop_failed=1
     else
-      if remove_wan_cake_root_if_owned "$control_wan"; then
-        wan_cleanup_confirmed=1
-        delete_ingress_redirect_filters "$control_wan"
-        remove_wan_ingress_qdisc_if_owned "$control_wan" || stop_failed=1
-        restore_offload_if_needed "$control_wan" || stop_failed=1
-      else
-        echo "WARN: Skipping additional WAN cleanup on '$control_wan' because root CAKE ownership cleanup failed." >&2
+      wan_cleanup_confirmed=1
+      wan_cleanup_complete=1
+      if ! remove_wan_cake_root_if_owned "$control_wan"; then
+        echo "WARN: Root CAKE ownership cleanup failed on '$control_wan'; continuing with remaining WAN cleanup." >&2
         stop_failed=1
+        wan_cleanup_complete=0
       fi
+      delete_ingress_redirect_filters "$control_wan"
+      if ! remove_wan_ingress_qdisc_if_owned "$control_wan"; then
+        stop_failed=1
+        wan_cleanup_complete=0
+      fi
+      if has_script_ingress_redirect_filters "$control_wan"; then
+        echo "WARN: Ingress redirect filters still exist on '$control_wan'; WAN cleanup is incomplete." >&2
+        stop_failed=1
+        wan_cleanup_complete=0
+      fi
+      restore_offload_if_needed "$control_wan" || stop_failed=1
     fi
   else
     echo "WARN: Cannot detect WAN interface, skipping WAN qdisc cleanup." >&2
     stop_failed=1
   fi
 
-  # IFB 清理（默认不删设备，避免影响其他服务）
-  if (( wan_cleanup_confirmed == 1 )); then
+  # IFB cleanup: default is qdisc-only; device delete is opt-in.
+  if (( wan_cleanup_confirmed == 1 && wan_cleanup_complete == 1 )); then
     if [[ -n "$control_wan" && "$IFB_DEV" == "$control_wan" ]]; then
       echo "WARN: IFB_DEV ('$IFB_DEV') matches WAN_IF; skipping IFB cleanup to avoid touching WAN root qdisc." >&2
       stop_failed=1
@@ -1254,6 +1477,8 @@ stop() {
         echo "WARN: Skipping IFB device delete because IFB qdisc cleanup failed." >&2
       fi
     fi
+  elif (( wan_cleanup_confirmed == 1 )); then
+    echo "WARN: Skipping IFB cleanup because WAN cleanup was incomplete." >&2
   else
     echo "WARN: Skipping IFB cleanup because WAN cleanup target was not confirmed." >&2
   fi
@@ -1285,10 +1510,19 @@ status() {
   fi
 }
 
+trap release_global_lock EXIT
+
 case "$CMD" in
-  start)   start ;;
-  stop)    stop ;;
+  start)
+    acquire_global_lock_or_exit
+    start
+    ;;
+  stop)
+    acquire_global_lock_or_exit
+    stop
+    ;;
   restart)
+    acquire_global_lock_or_exit
     restart_target="$(resolve_control_wan_if "${WAN_IF-}" || true)"
     if [[ -n "${restart_target-}" ]] && ! ip link show "$restart_target" >/dev/null 2>&1; then
       echo "WARN: Resolved restart WAN_IF '$restart_target' does not exist; falling back to auto-detection." >&2
@@ -1303,6 +1537,8 @@ case "$CMD" in
     start
     (( restart_stop_failed == 0 )) || exit 2
     ;;
-  status)  status ;;
+  status)
+    status
+    ;;
   *) echo "Usage: $0 {start|stop|restart|status} [WAN_IF]" >&2; exit 1 ;;
 esac
