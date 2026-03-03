@@ -244,6 +244,8 @@ should_skip_unowned_ifb_cleanup() {
 cleanup_ifb_qdisc_if_safe() {
   local ifb="$1"
   local root_kind=""
+  local default_kind=""
+  local post_kind=""
 
   if ! ip link show "$ifb" >/dev/null 2>&1; then
     return 0
@@ -270,9 +272,24 @@ cleanup_ifb_qdisc_if_safe() {
     fi
   fi
 
-  tc qdisc del dev "$ifb" root 2>/dev/null || true
+  if ! tc qdisc del dev "$ifb" root 2>/dev/null; then
+    echo "ERROR: Failed to remove CAKE root qdisc on IFB '$ifb'." >&2
+    return 1
+  fi
 
-  if [[ "$(ifb_root_qdisc_kind "$ifb")" == "cake" ]]; then
+  post_kind="$(ifb_root_qdisc_kind "$ifb")"
+  if [[ "$post_kind" == "cake" ]]; then
+    default_kind="$(kernel_default_qdisc_kind)"
+    if [[ "$default_kind" != "cake" ]]; then
+      echo "ERROR: Failed to remove CAKE root qdisc on IFB '$ifb'." >&2
+      return 1
+    fi
+    # default_qdisc=cake may re-attach a fresh default CAKE after deletion.
+    clear_ifb_qdisc_state "$ifb"
+    return 0
+  fi
+
+  if [[ "$post_kind" == "$root_kind" ]]; then
     echo "ERROR: Failed to remove CAKE root qdisc on IFB '$ifb'." >&2
     return 1
   fi
@@ -288,9 +305,23 @@ ifb_root_qdisc_kind() {
   echo "$kind"
 }
 
+kernel_default_qdisc_kind() {
+  local kind=""
+
+  if [[ -r /proc/sys/net/core/default_qdisc ]]; then
+    read -r kind </proc/sys/net/core/default_qdisc || true
+  elif command -v sysctl >/dev/null 2>&1; then
+    kind="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
+  fi
+
+  kind="${kind%%[[:space:]]*}"
+  echo "$kind"
+}
+
 validate_ifb_reuse_policy() {
   local ifb="$1"
   local root_kind=""
+  local default_kind=""
 
   case "${ALLOW_IFB_REUSE,,}" in
     yes|no) : ;;
@@ -302,6 +333,13 @@ validate_ifb_reuse_policy() {
 
   root_kind="$(ifb_root_qdisc_kind "$ifb")"
   [[ -z "$root_kind" || "$root_kind" == "noqueue" ]] && return 0
+
+  # Kernel may auto-attach the default qdisc when IFB is brought up,
+  # and stop() may intentionally leave IFB with that default qdisc.
+  default_kind="$(kernel_default_qdisc_kind)"
+  if [[ -n "$default_kind" && "$root_kind" == "$default_kind" ]]; then
+    return 0
+  fi
 
   if [[ "$root_kind" == "cake" ]]; then
     if ifb_is_marked_as_created "$ifb" || ifb_qdisc_is_owned "$ifb"; then
@@ -326,6 +364,7 @@ validate_ifb_reuse_policy() {
 delete_ifb_device_if_safe() {
   local ifb="$1"
   local root_kind=""
+  local default_kind=""
 
   if ! ip link show "$ifb" >/dev/null 2>&1; then
     clear_ifb_created_state "$ifb"
@@ -357,8 +396,11 @@ delete_ifb_device_if_safe() {
     return 1
   fi
 
+  default_kind="$(kernel_default_qdisc_kind)"
   if [[ "$root_kind" != "noqueue" ]]; then
-    if [[ "${ALLOW_IFB_REUSE,,}" == "yes" ]]; then
+    if [[ -n "$default_kind" && "$root_kind" == "$default_kind" ]]; then
+      :
+    elif [[ "${ALLOW_IFB_REUSE,,}" == "yes" ]]; then
       echo "WARN: Deleting IFB '$ifb' with root qdisc '$root_kind' because ALLOW_IFB_REUSE=yes." >&2
     else
       echo "ERROR: IFB '$ifb' has root qdisc '$root_kind'; refusing device delete without ALLOW_IFB_REUSE=yes." >&2
@@ -805,6 +847,8 @@ has_root_cake_qdisc() {
 remove_wan_cake_root_if_owned() {
   local dev="$1"
   local owner=""
+  local default_kind=""
+  local post_kind=""
 
   owner="$(load_root_cake_state || true)"
   if [[ -n "$owner" && "$owner" != "$dev" ]]; then
@@ -826,6 +870,12 @@ remove_wan_cake_root_if_owned() {
   fi
 
   if [[ -z "$owner" ]]; then
+    default_kind="$(kernel_default_qdisc_kind)"
+    if [[ "$default_kind" == "cake" ]]; then
+      echo "INFO: Root CAKE on '$dev' is unowned but matches kernel default; leaving it untouched." >&2
+      return 0
+    fi
+
     case "${ALLOW_UNOWNED_WAN_CAKE_DELETE,,}" in
       yes)
         echo "WARN: Root CAKE on '$dev' has no ownership marker; deleting due to ALLOW_UNOWNED_WAN_CAKE_DELETE=yes." >&2
@@ -842,11 +892,19 @@ remove_wan_cake_root_if_owned() {
     esac
   fi
 
-  tc qdisc del dev "$dev" root 2>/dev/null || true
-
-  if has_root_cake_qdisc "$dev"; then
+  if ! tc qdisc del dev "$dev" root 2>/dev/null; then
     echo "ERROR: Failed to remove CAKE root qdisc on '$dev'." >&2
     return 1
+  fi
+
+  post_kind="$(tc qdisc show dev "$dev" 2>/dev/null | awk '$4=="root" {print $2; exit}' || true)"
+  if [[ "$post_kind" == "cake" ]]; then
+    default_kind="$(kernel_default_qdisc_kind)"
+    if [[ "$default_kind" != "cake" ]]; then
+      echo "ERROR: Failed to remove CAKE root qdisc on '$dev'." >&2
+      return 1
+    fi
+    # default_qdisc=cake may re-attach a fresh default CAKE after deletion.
   fi
 
   clear_root_cake_state
@@ -902,6 +960,9 @@ apply_egress() {
 ensure_ifb_device() {
   local ifb="$1"
   local created_new=0
+  local was_up=0
+  local root_kind=""
+  local default_kind=""
 
   warn_virt_limits
   modprobe ifb 2>/dev/null || true
@@ -915,7 +976,20 @@ ensure_ifb_device() {
     ip link add "$ifb" type ifb
     created_new=1
   fi
+  if ip -o link show dev "$ifb" 2>/dev/null | grep -qE '<[^>]*\bUP\b'; then
+    was_up=1
+  fi
   ip link set "$ifb" up
+
+  # If IFB was down and just brought up, clear kernel auto default qdisc.
+  # This avoids false "in use" detection before this script can mark ownership.
+  if (( was_up == 0 )) && ! ifb_is_marked_as_created "$ifb" && ! ifb_qdisc_is_owned "$ifb"; then
+    root_kind="$(ifb_root_qdisc_kind "$ifb")"
+    default_kind="$(kernel_default_qdisc_kind)"
+    if (( created_new == 1 )) || [[ -n "$default_kind" && "$root_kind" == "$default_kind" ]]; then
+      tc qdisc del dev "$ifb" root 2>/dev/null || true
+    fi
+  fi
 
   if (( created_new == 1 )); then
     if ! save_ifb_created_state "$ifb"; then
