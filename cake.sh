@@ -1564,7 +1564,14 @@ disable_offload_if_needed() {
   local dev="$1"
   local state_file=""
 
-  [[ "${DISABLE_OFFLOAD,,}" == "yes" ]] || return 0
+  # Keep start idempotent across config changes:
+  # - DISABLE_OFFLOAD=yes: capture and disable offload.
+  # - DISABLE_OFFLOAD!=yes: attempt restore from saved state so yes->no applies on next start.
+  if [[ "${DISABLE_OFFLOAD,,}" != "yes" ]]; then
+    restore_offload_if_needed "$dev" || true
+    return 0
+  fi
+
   if ! command -v ethtool >/dev/null 2>&1; then
     echo "WARN: ethtool not found; skipping offload disable on '$dev'." >&2
     return 0
