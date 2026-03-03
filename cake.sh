@@ -28,8 +28,17 @@ DISABLE_OFFLOAD="${DISABLE_OFFLOAD:-yes}"  # yes/no; default yes, disable WAN ts
 DELETE_IFB_ON_STOP="${DELETE_IFB_ON_STOP:-no}"  # yes/no; delete IFB device on stop when yes.
 ALLOW_IFB_REUSE="${ALLOW_IFB_REUSE:-no}"        # yes/no; allow reusing non-owned IFB root qdisc.
 ALLOW_UNOWNED_WAN_CAKE_DELETE="${ALLOW_UNOWNED_WAN_CAKE_DELETE:-no}"  # yes/no; allow deleting unowned WAN root CAKE.
+RESTART_CONTINUE_ON_STOP_FAILURE="${RESTART_CONTINUE_ON_STOP_FAILURE:-no}"  # yes/no; continue restart start-phase if stop fails.
 INGRESS_PREF="${INGRESS_PREF:-49152}"           # Fixed pref used by this script's ingress filters.
 OFFLOAD_STATE_DIR="${OFFLOAD_STATE_DIR:-/run/qos-cake}"  # Directory for runtime state files.
+OFFLOAD_STATE_COMPAT_DIRS="${OFFLOAD_STATE_COMPAT_DIRS-}"  # Optional ":"-separated legacy state dirs for migration reads/cleanup.
+OFFLOAD_STATE_LEGACY_DIR="${OFFLOAD_STATE_LEGACY_DIR:-/run/qos-cake}"  # Built-in legacy state dir for backward-compatible reads/cleanup.
+ALLOW_ROOT_STATE_GLOBAL_SCAN="${ALLOW_ROOT_STATE_GLOBAL_SCAN:-no}"  # yes/no; allow expensive '/' scan to locate legacy root-cake.state.
+
+if [[ ! "$INGRESS_PREF" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: Invalid INGRESS_PREF='$INGRESS_PREF' (use digits only)." >&2
+  exit 1
+fi
 
 LOCK_FILE="${LOCK_FILE:-$OFFLOAD_STATE_DIR/qos-cake.lock}"
 LOCK_PID_FILE="${LOCK_PID_FILE:-$OFFLOAD_STATE_DIR/qos-cake.lock.pid}"
@@ -41,6 +50,8 @@ if [[ -n "${2:-}" ]]; then
 fi
 GLOBAL_LOCK_HELD=0
 GLOBAL_LOCK_KIND="none"
+STATE_DIR_DISCOVERY_CACHE=""
+STATE_DIR_DISCOVERY_READY=0
 
 warn_virt_limits() {
   # Common LXC/OpenVZ limitation: modprobe or IFB creation may be blocked.
@@ -75,7 +86,7 @@ nat_flag_auto() {
   local ipt_rules=""
   if command -v nft >/dev/null 2>&1; then
     nft_ruleset="$(nft list ruleset 2>/dev/null || true)"
-    if grep -qiE '\bmasquerade\b' <<<"$nft_ruleset"; then
+    if grep -qiE '(^|[[:space:]])masquerade([[:space:]]|$)' <<<"$nft_ruleset"; then
       echo "nat"
       return 0
     fi
@@ -83,7 +94,7 @@ nat_flag_auto() {
 
   if command -v iptables >/dev/null 2>&1; then
     ipt_rules="$(iptables -t nat -S 2>/dev/null || true)"
-    if grep -qiE '\bMASQUERADE\b' <<<"$ipt_rules"; then
+    if grep -qE '(^|[[:space:]])-j[[:space:]]+MASQUERADE([[:space:]]|$)' <<<"$ipt_rules"; then
       echo "nat"
       return 0
     fi
@@ -117,14 +128,110 @@ is_ifb_device() {
   grep -Fxq "$dev" <<<"$ifb_names"
 }
 
+discover_state_dirs_from_markers() {
+  local search_root=""
+  local state_file=""
+  local dir=""
+  local -A seen_roots=()
+  local -A seen_dirs=()
+
+  if (( STATE_DIR_DISCOVERY_READY == 1 )); then
+    [[ -n "$STATE_DIR_DISCOVERY_CACHE" ]] && printf '%s\n' "$STATE_DIR_DISCOVERY_CACHE"
+    return 0
+  fi
+  STATE_DIR_DISCOVERY_READY=1
+  STATE_DIR_DISCOVERY_CACHE=""
+
+  if ! command -v find >/dev/null 2>&1; then
+    return 0
+  fi
+
+  for search_root in "/run" "/var/run" "${OFFLOAD_STATE_DIR%/*}" "${OFFLOAD_STATE_LEGACY_DIR%/*}"; do
+    search_root="${search_root%/}"
+    [[ -z "$search_root" || "$search_root" == "." || "$search_root" == "/" ]] && continue
+    [[ -d "$search_root" ]] || continue
+    [[ -n "${seen_roots[$search_root]+x}" ]] && continue
+    seen_roots["$search_root"]=1
+
+    while IFS= read -r state_file; do
+      [[ -n "$state_file" ]] || continue
+      dir="${state_file%/*}"
+      [[ -n "$dir" ]] || continue
+      [[ -n "${seen_dirs[$dir]+x}" ]] && continue
+      seen_dirs["$dir"]=1
+
+      if [[ -z "$STATE_DIR_DISCOVERY_CACHE" ]]; then
+        STATE_DIR_DISCOVERY_CACHE="$dir"
+      else
+        STATE_DIR_DISCOVERY_CACHE+=$'\n'"$dir"
+      fi
+    done < <(
+      find "$search_root" -maxdepth 5 -type f \
+        \( -name 'root-cake.state' -o -name 'wan-if.state' -o -name 'ingress-qdisc.state' -o -name 'offload-*.state' -o -name 'ifb-created-*.state' -o -name 'ifb-qdisc-*.state' \) \
+        2>/dev/null || true
+    )
+  done
+
+  [[ -n "$STATE_DIR_DISCOVERY_CACHE" ]] && printf '%s\n' "$STATE_DIR_DISCOVERY_CACHE"
+}
+
+state_dir_candidates() {
+  local entry=""
+  local -a compat_dirs=()
+  local -A seen=()
+
+  entry="${OFFLOAD_STATE_DIR%/}"
+  if [[ -n "$entry" ]]; then
+    seen["$entry"]=1
+    echo "$entry"
+  fi
+
+  if [[ -n "${OFFLOAD_STATE_COMPAT_DIRS//[[:space:]]/}" ]]; then
+    IFS=':' read -r -a compat_dirs <<<"$OFFLOAD_STATE_COMPAT_DIRS"
+    for entry in "${compat_dirs[@]}"; do
+      entry="${entry%/}"
+      [[ -z "$entry" ]] && continue
+      if [[ -z "${seen[$entry]+x}" ]]; then
+        seen["$entry"]=1
+        echo "$entry"
+      fi
+    done
+  fi
+
+  for entry in "$OFFLOAD_STATE_LEGACY_DIR" "/run/qos-cake" "/var/run/qos-cake"; do
+    entry="${entry%/}"
+    [[ -z "$entry" ]] && continue
+    if [[ -z "${seen[$entry]+x}" ]]; then
+      seen["$entry"]=1
+      echo "$entry"
+    fi
+  done
+
+  while IFS= read -r entry; do
+    entry="${entry%/}"
+    [[ -z "$entry" ]] && continue
+    if [[ -z "${seen[$entry]+x}" ]]; then
+      seen["$entry"]=1
+      echo "$entry"
+    fi
+  done < <(discover_state_dirs_from_markers)
+}
+
 ifb_created_state_file() {
   local dev="$1"
+  ifb_created_state_file_for_dir "$OFFLOAD_STATE_DIR" "$dev"
+}
+
+ifb_created_state_file_for_dir() {
+  local dir="$1"
+  local dev="$2"
   local safe="$dev"
 
   safe="${safe//\//_}"
   safe="${safe//:/_}"
+  dir="${dir%/}"
 
-  echo "$OFFLOAD_STATE_DIR/ifb-created-${safe}.state"
+  echo "$dir/ifb-created-${safe}.state"
 }
 
 save_ifb_created_state() {
@@ -151,38 +258,52 @@ save_ifb_created_state() {
 
 ifb_is_marked_as_created() {
   local ifb="$1"
+  local dir=""
   local state_file=""
   local dev=""
 
-  state_file="$(ifb_created_state_file "$ifb")"
-  [[ -r "$state_file" ]] || return 1
+  while IFS= read -r dir; do
+    state_file="$(ifb_created_state_file_for_dir "$dir" "$ifb")"
+    [[ -r "$state_file" ]] || continue
 
-  dev="$(awk 'NR==1 {print; exit}' "$state_file" 2>/dev/null || true)"
-  dev="${dev%$'\r'}"
-  if [[ "$dev" == "$ifb" ]]; then
-    return 0
-  fi
+    dev="$(awk 'NR==1 {print; exit}' "$state_file" 2>/dev/null || true)"
+    dev="${dev%$'\r'}"
+    if [[ "$dev" == "$ifb" ]]; then
+      return 0
+    fi
 
-  rm -f "$state_file" 2>/dev/null || true
+    rm -f "$state_file" 2>/dev/null || true
+  done < <(state_dir_candidates)
+
   return 1
 }
 
 clear_ifb_created_state() {
   local ifb="$1"
+  local dir=""
   local state_file=""
 
-  state_file="$(ifb_created_state_file "$ifb")"
-  rm -f "$state_file" 2>/dev/null || true
+  while IFS= read -r dir; do
+    state_file="$(ifb_created_state_file_for_dir "$dir" "$ifb")"
+    rm -f "$state_file" 2>/dev/null || true
+  done < <(state_dir_candidates)
 }
 
 ifb_qdisc_state_file() {
   local dev="$1"
+  ifb_qdisc_state_file_for_dir "$OFFLOAD_STATE_DIR" "$dev"
+}
+
+ifb_qdisc_state_file_for_dir() {
+  local dir="$1"
+  local dev="$2"
   local safe="$dev"
 
   safe="${safe//\//_}"
   safe="${safe//:/_}"
+  dir="${dir%/}"
 
-  echo "$OFFLOAD_STATE_DIR/ifb-qdisc-${safe}.state"
+  echo "$dir/ifb-qdisc-${safe}.state"
 }
 
 save_ifb_qdisc_state() {
@@ -209,28 +330,35 @@ save_ifb_qdisc_state() {
 
 ifb_qdisc_is_owned() {
   local ifb="$1"
+  local dir=""
   local state_file=""
   local dev=""
 
-  state_file="$(ifb_qdisc_state_file "$ifb")"
-  [[ -r "$state_file" ]] || return 1
+  while IFS= read -r dir; do
+    state_file="$(ifb_qdisc_state_file_for_dir "$dir" "$ifb")"
+    [[ -r "$state_file" ]] || continue
 
-  dev="$(awk 'NR==1 {print; exit}' "$state_file" 2>/dev/null || true)"
-  dev="${dev%$'\r'}"
-  if [[ "$dev" == "$ifb" ]]; then
-    return 0
-  fi
+    dev="$(awk 'NR==1 {print; exit}' "$state_file" 2>/dev/null || true)"
+    dev="${dev%$'\r'}"
+    if [[ "$dev" == "$ifb" ]]; then
+      return 0
+    fi
 
-  rm -f "$state_file" 2>/dev/null || true
+    rm -f "$state_file" 2>/dev/null || true
+  done < <(state_dir_candidates)
+
   return 1
 }
 
 clear_ifb_qdisc_state() {
   local ifb="$1"
+  local dir=""
   local state_file=""
 
-  state_file="$(ifb_qdisc_state_file "$ifb")"
-  rm -f "$state_file" 2>/dev/null || true
+  while IFS= read -r dir; do
+    state_file="$(ifb_qdisc_state_file_for_dir "$dir" "$ifb")"
+    rm -f "$state_file" 2>/dev/null || true
+  done < <(state_dir_candidates)
 }
 
 should_skip_unowned_ifb_cleanup() {
@@ -306,7 +434,17 @@ ifb_root_qdisc_kind() {
   local ifb="$1"
   local kind=""
 
-  kind="$(tc qdisc show dev "$ifb" 2>/dev/null | awk '$4=="root" {print $2; exit}' || true)"
+  kind="$(tc qdisc show dev "$ifb" 2>/dev/null | awk '
+    $1 == "qdisc" {
+      kind = $2
+      for (i = 1; i <= NF; i++) {
+        if ($i == "root") {
+          print kind
+          exit
+        }
+      }
+    }
+  ' || true)"
   echo "$kind"
 }
 
@@ -425,18 +563,261 @@ delete_ifb_device_if_safe() {
   clear_ifb_qdisc_state "$ifb"
 }
 
+list_script_ingress_redirect_specs_for_ifb() {
+  local wan="$1"
+  local ifb="$2"
+  local filter_dump=""
+
+  filter_dump="$(tc filter show dev "$wan" parent ffff: 2>/dev/null || true)"
+  if [[ -z "${filter_dump//[[:space:]]/}" ]]; then
+    filter_dump="$(tc filter show dev "$wan" ingress 2>/dev/null || true)"
+  fi
+  [[ -n "${filter_dump//[[:space:]]/}" ]] || return 0
+
+  awk -v ifb="$ifb" '
+    BEGIN {
+      want = tolower(ifb)
+      pref = ""
+      proto = ""
+      handle = ""
+      has_u32 = 0
+      has_u32_matchall = 0
+      has_ifb_redirect = 0
+    }
+    function reset_state() {
+      pref = ""
+      proto = ""
+      handle = ""
+      has_u32 = 0
+      has_u32_matchall = 0
+      has_ifb_redirect = 0
+    }
+    function emit_if_match() {
+      if (pref != "" && proto != "" && handle != "" && has_u32 == 1 && has_u32_matchall == 1 && has_ifb_redirect == 1) {
+        print pref "|" proto "|" handle
+      }
+      reset_state()
+    }
+    /^[[:space:]]*filter[[:space:]]/ {
+      emit_if_match()
+      for (i = 1; i <= NF; i++) {
+        if ($i == "pref" && (i + 1) <= NF) {
+          pref = $(i + 1)
+          gsub(/[^0-9].*$/, "", pref)
+          continue
+        }
+        if ($i == "protocol" && (i + 1) <= NF) {
+          proto = tolower($(i + 1))
+          gsub(/[^[:alnum:]_.:-].*$/, "", proto)
+          continue
+        }
+        if (($i == "fh" || $i == "handle") && (i + 1) <= NF) {
+          handle = tolower($(i + 1))
+          gsub(/[^0-9a-fx:]/, "", handle)
+          continue
+        }
+        if ($i == "u32") {
+          has_u32 = 1
+        }
+      }
+      next
+    }
+    {
+      line = tolower($0)
+      if (index(line, "match 00000000/00000000") > 0) {
+        has_u32_matchall = 1
+      }
+      if (index(line, "mirred") > 0 && index(line, "redirect") > 0) {
+        # tc may print either "dev <ifname>" or "to device <ifname>".
+        normalized = line
+        gsub(/[()]/, " ", normalized)
+        n = split(normalized, fields, /[[:space:]]+/)
+        for (i = 1; i < n; i++) {
+          if (fields[i] == "dev" || fields[i] == "device") {
+            candidate = fields[i + 1]
+            gsub(/[^[:alnum:]_.:-].*$/, "", candidate)
+            if (candidate == want) {
+              has_ifb_redirect = 1
+              break
+            }
+          }
+        }
+      }
+    }
+    END {
+      emit_if_match()
+    }
+  ' <<<"$filter_dump" | awk -F'|' 'NF == 3 && !seen[$0]++'
+}
+
+list_script_ingress_redirect_prefs_for_ifb() {
+  local wan="$1"
+  local ifb="$2"
+  local filter_dump=""
+
+  filter_dump="$(tc filter show dev "$wan" parent ffff: 2>/dev/null || true)"
+  if [[ -z "${filter_dump//[[:space:]]/}" ]]; then
+    filter_dump="$(tc filter show dev "$wan" ingress 2>/dev/null || true)"
+  fi
+  [[ -n "${filter_dump//[[:space:]]/}" ]] || return 0
+
+  awk -v ifb="$ifb" '
+    BEGIN {
+      want = tolower(ifb)
+      pref = ""
+      has_u32_matchall = 0
+      has_ifb_redirect = 0
+    }
+    function emit_if_match() {
+      if (pref != "" && has_u32_matchall == 1 && has_ifb_redirect == 1) {
+        print pref
+      }
+      pref = ""
+      has_u32_matchall = 0
+      has_ifb_redirect = 0
+    }
+    /^[[:space:]]*filter[[:space:]]/ {
+      emit_if_match()
+      for (i = 1; i <= NF; i++) {
+        if ($i == "pref" && (i + 1) <= NF) {
+          pref = $(i + 1)
+          gsub(/[^0-9].*$/, "", pref)
+          break
+        }
+      }
+      next
+    }
+    {
+      line = tolower($0)
+      if (index(line, "match 00000000/00000000") > 0) {
+        has_u32_matchall = 1
+      }
+      if (index(line, "mirred") > 0 && index(line, "redirect") > 0) {
+        # tc may print either "dev <ifname>" or "to device <ifname>".
+        normalized = line
+        gsub(/[()]/, " ", normalized)
+        n = split(normalized, fields, /[[:space:]]+/)
+        for (i = 1; i < n; i++) {
+          if (fields[i] == "dev" || fields[i] == "device") {
+            candidate = fields[i + 1]
+            gsub(/[^[:alnum:]_.:-].*$/, "", candidate)
+            if (candidate == want) {
+              has_ifb_redirect = 1
+              break
+            }
+          }
+        }
+      }
+    }
+    END {
+      emit_if_match()
+    }
+  ' <<<"$filter_dump" | awk 'NF && !seen[$0]++'
+}
+
+list_marked_ifb_qdisc_devices() {
+  local dir=""
+  local state_file=""
+  local dev=""
+
+  while IFS= read -r dir; do
+    for state_file in "$dir"/ifb-qdisc-*.state; do
+      [[ -r "$state_file" ]] || continue
+
+      dev="$(awk 'NR==1 {print; exit}' "$state_file" 2>/dev/null || true)"
+      dev="${dev%$'\r'}"
+      if [[ -z "$dev" ]]; then
+        rm -f "$state_file" 2>/dev/null || true
+        continue
+      fi
+      echo "$dev"
+    done
+  done < <(state_dir_candidates) | awk 'NF && !seen[$0]++'
+}
+
+list_ingress_redirect_cleanup_ifb_candidates() {
+  local preferred_ifb="${1-}"
+  local candidate=""
+  local -A seen=()
+
+  if [[ -n "$preferred_ifb" ]]; then
+    seen["$preferred_ifb"]=1
+    echo "$preferred_ifb"
+  fi
+
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    if [[ -z "${seen[$candidate]+x}" ]]; then
+      seen["$candidate"]=1
+      echo "$candidate"
+    fi
+  done < <(list_marked_ifb_qdisc_devices)
+}
+
+delete_ingress_redirect_filter_spec() {
+  local wan="$1"
+  local pref="$2"
+  local proto="$3"
+  local handle="$4"
+
+  [[ "$pref" =~ ^[0-9]+$ ]] || return 0
+  case "$proto" in
+    all|ip|ipv6) : ;;
+    *) return 0 ;;
+  esac
+  [[ "$handle" =~ ^[0-9a-fx:]+$ ]] || return 0
+
+  # Delete only the exact script-managed u32 filter to avoid removing unrelated rules
+  # that happen to share the same pref/protocol.
+  tc filter del dev "$wan" parent ffff: protocol "$proto" pref "$pref" handle "$handle" u32 2>/dev/null || \
+    tc filter del dev "$wan" parent ffff: protocol "$proto" prio "$pref" handle "$handle" u32 2>/dev/null || \
+    tc filter del dev "$wan" ingress protocol "$proto" pref "$pref" handle "$handle" u32 2>/dev/null || \
+    tc filter del dev "$wan" ingress protocol "$proto" prio "$pref" handle "$handle" u32 2>/dev/null || true
+}
+
 delete_ingress_redirect_filters() {
   local wan="$1"
+  local ifb="${2-}"
+  local spec=""
+  local pref=""
+  local proto=""
+  local handle=""
+  local candidate_ifb=""
+  local -A seen_specs=()
 
-  # Also remove legacy protocol-all rule from older script versions.
-  tc filter del dev "$wan" parent ffff: pref "$INGRESS_PREF" protocol all 2>/dev/null || true
-  tc filter del dev "$wan" parent ffff: pref "$INGRESS_PREF" protocol ip 2>/dev/null || true
-  tc filter del dev "$wan" parent ffff: pref "$INGRESS_PREF" protocol ipv6 2>/dev/null || true
+  while IFS= read -r candidate_ifb; do
+    [[ -n "$candidate_ifb" ]] || continue
+    while IFS= read -r spec; do
+      [[ -n "$spec" ]] || continue
+      if [[ -n "${seen_specs[$spec]+x}" ]]; then
+        continue
+      fi
+      seen_specs["$spec"]=1
+
+      IFS='|' read -r pref proto handle <<<"$spec"
+      [[ -n "$pref" && -n "$proto" && -n "$handle" ]] || continue
+      delete_ingress_redirect_filter_spec "$wan" "$pref" "$proto" "$handle"
+    done < <(list_script_ingress_redirect_specs_for_ifb "$wan" "$candidate_ifb")
+  done < <(list_ingress_redirect_cleanup_ifb_candidates "$ifb")
 }
 
 has_script_ingress_redirect_filters() {
   local wan="$1"
+  local ifb="${2-}"
   local filter_dump=""
+  local found_legacy_prefs=""
+  local candidate_ifb=""
+
+  if [[ -n "$ifb" ]]; then
+    while IFS= read -r candidate_ifb; do
+      [[ -n "$candidate_ifb" ]] || continue
+      found_legacy_prefs="$(list_script_ingress_redirect_prefs_for_ifb "$wan" "$candidate_ifb" || true)"
+      if [[ -n "${found_legacy_prefs//[[:space:]]/}" ]]; then
+        return 0
+      fi
+    done < <(list_ingress_redirect_cleanup_ifb_candidates "$ifb")
+    return 1
+  fi
 
   filter_dump="$(tc filter show dev "$wan" parent ffff: 2>/dev/null || true)"
   if [[ -z "${filter_dump//[[:space:]]/}" ]]; then
@@ -446,8 +827,14 @@ has_script_ingress_redirect_filters() {
   grep -qE "(^|[[:space:]])pref[[:space:]]+$INGRESS_PREF([[:space:]]|$)" <<<"$filter_dump"
 }
 
+ingress_qdisc_state_file_for_dir() {
+  local dir="$1"
+  dir="${dir%/}"
+  echo "$dir/ingress-qdisc.state"
+}
+
 ingress_qdisc_state_file() {
-  echo "$OFFLOAD_STATE_DIR/ingress-qdisc.state"
+  ingress_qdisc_state_file_for_dir "$OFFLOAD_STATE_DIR"
 }
 
 save_ingress_qdisc_state() {
@@ -474,28 +861,36 @@ save_ingress_qdisc_state() {
 
 ingress_qdisc_is_owned() {
   local dev="$1"
+  local dir=""
   local state_file=""
   local owner=""
 
-  state_file="$(ingress_qdisc_state_file)"
-  [[ -r "$state_file" ]] || return 1
+  while IFS= read -r dir; do
+    state_file="$(ingress_qdisc_state_file_for_dir "$dir")"
+    [[ -r "$state_file" ]] || continue
 
-  owner="$(awk 'NR==1 {print; exit}' "$state_file" 2>/dev/null || true)"
-  owner="${owner%$'\r'}"
-  if [[ "$owner" == "$dev" ]]; then
-    return 0
-  fi
+    owner="$(awk 'NR==1 {print; exit}' "$state_file" 2>/dev/null || true)"
+    owner="${owner%$'\r'}"
+    if [[ "$owner" == "$dev" ]]; then
+      return 0
+    fi
 
-  if [[ -z "$owner" ]]; then
-    rm -f "$state_file" 2>/dev/null || true
-  fi
+    if [[ -z "$owner" ]]; then
+      rm -f "$state_file" 2>/dev/null || true
+    fi
+  done < <(state_dir_candidates)
+
   return 1
 }
 
 clear_ingress_qdisc_state() {
+  local dir=""
   local state_file=""
-  state_file="$(ingress_qdisc_state_file)"
-  rm -f "$state_file" 2>/dev/null || true
+
+  while IFS= read -r dir; do
+    state_file="$(ingress_qdisc_state_file_for_dir "$dir")"
+    rm -f "$state_file" 2>/dev/null || true
+  done < <(state_dir_candidates)
 }
 
 remove_wan_ingress_qdisc_if_owned() {
@@ -515,7 +910,7 @@ remove_wan_ingress_qdisc_if_owned() {
   fi
 
   qdisc_dump="$(tc qdisc show dev "$dev" 2>/dev/null || true)"
-  if ! grep -qE '\b(ingress|clsact)\b' <<<"$qdisc_dump"; then
+  if ! grep -qE '^[[:space:]]*qdisc[[:space:]]+(ingress|clsact)([[:space:]]|$)' <<<"$qdisc_dump"; then
     clear_ingress_qdisc_state
     return 0
   fi
@@ -532,18 +927,18 @@ remove_wan_ingress_qdisc_if_owned() {
     fi
   fi
   if [[ -n "${filter_dump//[[:space:]]/}" ]]; then
-    echo "INFO: Ingress/clsact qdisc on '$dev' still has filters; skipping owned qdisc delete." >&2
-    return 0
+    echo "ERROR: Ingress/clsact qdisc on '$dev' still has filters; owned qdisc delete is incomplete." >&2
+    return 1
   fi
 
-  if grep -qE '\bclsact\b' <<<"$qdisc_dump"; then
+  if grep -qE '^[[:space:]]*qdisc[[:space:]]+clsact([[:space:]]|$)' <<<"$qdisc_dump"; then
     tc qdisc del dev "$dev" clsact 2>/dev/null || true
   else
     tc qdisc del dev "$dev" ingress 2>/dev/null || true
   fi
 
   qdisc_dump="$(tc qdisc show dev "$dev" 2>/dev/null || true)"
-  if grep -qE '\b(ingress|clsact)\b' <<<"$qdisc_dump"; then
+  if grep -qE '^[[:space:]]*qdisc[[:space:]]+(ingress|clsact)([[:space:]]|$)' <<<"$qdisc_dump"; then
     echo "ERROR: Failed to remove owned ingress/clsact qdisc on '$dev'." >&2
     return 1
   fi
@@ -642,7 +1037,62 @@ acquire_global_lock_or_exit() {
 }
 
 wan_if_state_file() {
-  echo "$OFFLOAD_STATE_DIR/wan-if.state"
+  echo "${OFFLOAD_STATE_DIR%/}/wan-if.state"
+}
+
+load_named_state_from_candidates() {
+  local state_name="$1"
+  local out_value_var="$2"
+  local out_file_var="$3"
+  local dir=""
+  local state_file=""
+  local value=""
+
+  while IFS= read -r dir; do
+    state_file="${dir%/}/$state_name"
+    [[ -r "$state_file" ]] || continue
+
+    value="$(awk 'NR==1 {print; exit}' "$state_file" 2>/dev/null || true)"
+    value="${value%$'\r'}"
+    if [[ -z "$value" ]]; then
+      rm -f "$state_file" 2>/dev/null || true
+      continue
+    fi
+
+    printf -v "$out_value_var" '%s' "$value"
+    printf -v "$out_file_var" '%s' "$state_file"
+    return 0
+  done < <(state_dir_candidates)
+
+  printf -v "$out_value_var" ''
+  printf -v "$out_file_var" ''
+  return 1
+}
+
+migrate_named_state_to_primary_if_needed() {
+  local source_file="$1"
+  local target_file="$2"
+  local value="$3"
+  local tmp_file=""
+
+  [[ -n "$source_file" && -n "$target_file" && -n "$value" ]] || return 0
+  [[ "$source_file" == "$target_file" ]] && return 0
+
+  if ! mkdir -p "$OFFLOAD_STATE_DIR" 2>/dev/null; then
+    echo "WARN: Failed to create state directory '$OFFLOAD_STATE_DIR'; keeping compatibility state file '$source_file'." >&2
+    return 1
+  fi
+
+  tmp_file="${target_file}.tmp.$$"
+  if printf '%s\n' "$value" >"$tmp_file" 2>/dev/null && \
+    mv -f "$tmp_file" "$target_file" 2>/dev/null; then
+    rm -f "$source_file" 2>/dev/null || true
+    return 0
+  fi
+
+  rm -f "$tmp_file" 2>/dev/null || true
+  echo "WARN: Failed to migrate state from '$source_file' to '$target_file'; keeping compatibility state file." >&2
+  return 1
 }
 
 save_wan_if_state() {
@@ -668,18 +1118,16 @@ save_wan_if_state() {
 }
 
 load_wan_if_state() {
-  local state_file=""
+  local selected_state_file=""
+  local primary_state_file=""
   local dev=""
 
-  state_file="$(wan_if_state_file)"
-  [[ -r "$state_file" ]] || return 1
-
-  dev="$(awk 'NR==1 {print; exit}' "$state_file" 2>/dev/null || true)"
-  dev="${dev%$'\r'}"
-  if [[ -z "$dev" ]]; then
-    rm -f "$state_file" 2>/dev/null || true
+  if ! load_named_state_from_candidates "wan-if.state" dev selected_state_file; then
     return 1
   fi
+
+  primary_state_file="$(wan_if_state_file)"
+  migrate_named_state_to_primary_if_needed "$selected_state_file" "$primary_state_file" "$dev" || true
 
   if ! ip link show "$dev" >/dev/null 2>&1; then
     echo "WARN: Stored WAN_IF '$dev' is unavailable; keeping pinned WAN_IF for deterministic cleanup targeting." >&2
@@ -737,11 +1185,27 @@ resolve_control_wan_if() {
       echo "$root_owned"
       return 0
     fi
+    detected="$(detect_wan_if || true)"
+    if [[ -n "$detected" ]]; then
+      echo "WARN: Pinned WAN_IF '$pinned' is unavailable; using detected WAN_IF '$detected'." >&2
+      echo "$detected"
+      return 0
+    fi
     echo "$pinned"
     return 0
   fi
 
   if [[ -n "$root_owned" ]]; then
+    if ip link show "$root_owned" >/dev/null 2>&1; then
+      echo "$root_owned"
+      return 0
+    fi
+    detected="$(detect_wan_if || true)"
+    if [[ -n "$detected" ]]; then
+      echo "WARN: Root-owned WAN_IF '$root_owned' is unavailable; using detected WAN_IF '$detected'." >&2
+      echo "$detected"
+      return 0
+    fi
     echo "$root_owned"
     return 0
   fi
@@ -751,13 +1215,39 @@ resolve_control_wan_if() {
 }
 
 clear_wan_if_state() {
+  local entry=""
   local state_file=""
-  state_file="$(wan_if_state_file)"
-  rm -f "$state_file" 2>/dev/null || true
+  local -a compat_dirs=()
+  local -A seen=()
+
+  entry="${OFFLOAD_STATE_DIR%/}"
+  if [[ -n "$entry" ]]; then
+    seen["$entry"]=1
+    rm -f "${entry}/wan-if.state" 2>/dev/null || true
+  fi
+
+  if [[ -n "${OFFLOAD_STATE_COMPAT_DIRS//[[:space:]]/}" ]]; then
+    IFS=':' read -r -a compat_dirs <<<"$OFFLOAD_STATE_COMPAT_DIRS"
+    for entry in "${compat_dirs[@]}"; do
+      entry="${entry%/}"
+      [[ -z "$entry" || -n "${seen[$entry]+x}" ]] && continue
+      seen["$entry"]=1
+      state_file="${entry}/wan-if.state"
+      rm -f "$state_file" 2>/dev/null || true
+    done
+  fi
+
+  for entry in "$OFFLOAD_STATE_LEGACY_DIR" "/run/qos-cake" "/var/run/qos-cake"; do
+    entry="${entry%/}"
+    [[ -z "$entry" || -n "${seen[$entry]+x}" ]] && continue
+    seen["$entry"]=1
+    state_file="${entry}/wan-if.state"
+    rm -f "$state_file" 2>/dev/null || true
+  done
 }
 
 root_cake_state_file() {
-  echo "$OFFLOAD_STATE_DIR/root-cake.state"
+  echo "${OFFLOAD_STATE_DIR%/}/root-cake.state"
 }
 
 save_root_cake_state() {
@@ -783,18 +1273,16 @@ save_root_cake_state() {
 }
 
 load_root_cake_state() {
-  local state_file=""
+  local selected_state_file=""
+  local primary_state_file=""
   local dev=""
 
-  state_file="$(root_cake_state_file)"
-  [[ -r "$state_file" ]] || return 1
-
-  dev="$(awk 'NR==1 {print; exit}' "$state_file" 2>/dev/null || true)"
-  dev="${dev%$'\r'}"
-  if [[ -z "$dev" ]]; then
-    rm -f "$state_file" 2>/dev/null || true
+  if ! load_named_state_from_candidates "root-cake.state" dev selected_state_file; then
     return 1
   fi
+
+  primary_state_file="$(root_cake_state_file)"
+  migrate_named_state_to_primary_if_needed "$selected_state_file" "$primary_state_file" "$dev" || true
 
   if ! ip link show "$dev" >/dev/null 2>&1; then
     echo "WARN: Stored root-cake interface '$dev' is unavailable; keeping marker for deterministic cleanup targeting." >&2
@@ -804,9 +1292,125 @@ load_root_cake_state() {
 }
 
 clear_root_cake_state() {
+  local entry=""
   local state_file=""
-  state_file="$(root_cake_state_file)"
-  rm -f "$state_file" 2>/dev/null || true
+  local -a compat_dirs=()
+  local -A seen=()
+
+  entry="${OFFLOAD_STATE_DIR%/}"
+  if [[ -n "$entry" ]]; then
+    seen["$entry"]=1
+    rm -f "${entry}/root-cake.state" 2>/dev/null || true
+  fi
+
+  if [[ -n "${OFFLOAD_STATE_COMPAT_DIRS//[[:space:]]/}" ]]; then
+    IFS=':' read -r -a compat_dirs <<<"$OFFLOAD_STATE_COMPAT_DIRS"
+    for entry in "${compat_dirs[@]}"; do
+      entry="${entry%/}"
+      [[ -z "$entry" || -n "${seen[$entry]+x}" ]] && continue
+      seen["$entry"]=1
+      state_file="${entry}/root-cake.state"
+      rm -f "$state_file" 2>/dev/null || true
+    done
+  fi
+
+  for entry in "$OFFLOAD_STATE_LEGACY_DIR" "/run/qos-cake" "/var/run/qos-cake"; do
+    entry="${entry%/}"
+    [[ -z "$entry" || -n "${seen[$entry]+x}" ]] && continue
+    seen["$entry"]=1
+    state_file="${entry}/root-cake.state"
+    rm -f "$state_file" 2>/dev/null || true
+  done
+}
+
+find_compat_root_cake_state_file_for_dev() {
+  local dev="$1"
+  local allow_global_scan="${2:-$ALLOW_ROOT_STATE_GLOBAL_SCAN}"
+  local dir=""
+  local state_file=""
+  local owner=""
+  local wan_state_file=""
+  local wan_state=""
+
+  while IFS= read -r dir; do
+    state_file="$dir/root-cake.state"
+    [[ -r "$state_file" ]] || continue
+
+    owner="$(awk 'NR==1 {print; exit}' "$state_file" 2>/dev/null || true)"
+    owner="${owner%$'\r'}"
+    if [[ "$owner" == "$dev" ]]; then
+      wan_state_file="$dir/wan-if.state"
+      if [[ -r "$wan_state_file" ]]; then
+        wan_state="$(awk 'NR==1 {print; exit}' "$wan_state_file" 2>/dev/null || true)"
+        wan_state="${wan_state%$'\r'}"
+        if [[ -n "$wan_state" && "$wan_state" != "$dev" ]]; then
+          continue
+        fi
+      fi
+      echo "$state_file"
+      return 0
+    fi
+  done < <(state_dir_candidates)
+
+  case "${allow_global_scan,,}" in
+    yes)
+      ;;
+    no)
+      return 1
+      ;;
+    *)
+      echo "WARN: Invalid ALLOW_ROOT_STATE_GLOBAL_SCAN='$allow_global_scan' (use yes/no); skipping global compatibility scan." >&2
+      return 1
+      ;;
+  esac
+
+  state_file="$(find_root_cake_state_file_for_dev_via_global_scan "$dev" || true)"
+  if [[ -n "$state_file" ]]; then
+    echo "$state_file"
+    return 0
+  fi
+
+  return 1
+}
+
+find_root_cake_state_file_for_dev_via_global_scan() {
+  local dev="$1"
+  local state_file=""
+  local dir=""
+  local owner=""
+  local wan_state_file=""
+  local wan_state=""
+
+  command -v find >/dev/null 2>&1 || return 1
+
+  while IFS= read -r state_file; do
+    [[ -r "$state_file" ]] || continue
+    dir="${state_file%/*}"
+    [[ -n "$dir" ]] || continue
+
+    owner="$(awk 'NR==1 {print; exit}' "$state_file" 2>/dev/null || true)"
+    owner="${owner%$'\r'}"
+    [[ "$owner" == "$dev" ]] || continue
+
+    wan_state_file="$dir/wan-if.state"
+    if [[ -r "$wan_state_file" ]]; then
+      wan_state="$(awk 'NR==1 {print; exit}' "$wan_state_file" 2>/dev/null || true)"
+      wan_state="${wan_state%$'\r'}"
+      if [[ -n "$wan_state" && "$wan_state" != "$dev" ]]; then
+        continue
+      fi
+    fi
+
+    echo "$state_file"
+    return 0
+  done < <(
+    # Fallback scan for old custom state dirs after OFFLOAD_STATE_DIR changes.
+    find / -maxdepth 8 \
+      \( -path '/proc' -o -path '/proc/*' -o -path '/sys' -o -path '/sys/*' -o -path '/dev' -o -path '/dev/*' \) -prune -o \
+      -type f -name 'root-cake.state' -print 2>/dev/null || true
+  )
+
+  return 1
 }
 
 root_cake_signature() {
@@ -814,18 +1418,30 @@ root_cake_signature() {
   local sig=""
 
   sig="$(tc qdisc show dev "$dev" 2>/dev/null | \
-    awk '$2=="cake" && $4=="root" {
-      start=5
-      if ($5=="refcnt" && $6 ~ /^[0-9]+$/) {
-        start=7
+    awk '
+      $1 == "qdisc" && $2 == "cake" {
+        root_idx = 0
+        out = ""
+        for (i = 1; i <= NF; i++) {
+          if ($i == "root") {
+            root_idx = i
+            break
+          }
+        }
+        if (root_idx == 0) {
+          next
+        }
+        for (i = root_idx + 1; i <= NF; i++) {
+          if ($i == "refcnt" && (i + 1) <= NF && $(i + 1) ~ /^[0-9]+$/) {
+            i++
+            continue
+          }
+          out = out (out == "" ? "" : " ") $i
+        }
+        print out
+        exit
       }
-      out=""
-      for (i=start; i<=NF; i++) {
-        out = out (out=="" ? "" : " ") $i
-      }
-      print out
-      exit
-    }' || true)"
+    ' || true)"
 
   echo "$sig"
 }
@@ -849,32 +1465,78 @@ ensure_preexisting_root_cake_unchanged_after_rollback() {
 
 offload_state_file() {
   local dev="$1"
+  offload_state_file_for_dir "$OFFLOAD_STATE_DIR" "$dev"
+}
+
+offload_state_file_for_dir() {
+  local dir="$1"
+  local dev="$2"
   local safe="$dev"
 
   safe="${safe//\//_}"
   safe="${safe//:/_}"
+  dir="${dir%/}"
 
-  echo "$OFFLOAD_STATE_DIR/offload-${safe}.state"
+  echo "$dir/offload-${safe}.state"
+}
+
+list_existing_offload_state_files_for_dev() {
+  local dev="$1"
+  local dir=""
+  local state_file=""
+
+  while IFS= read -r dir; do
+    state_file="$(offload_state_file_for_dir "$dir" "$dev")"
+    [[ -r "$state_file" ]] || continue
+    echo "$state_file"
+  done < <(state_dir_candidates)
+}
+
+clear_all_offload_state_files_for_dev() {
+  local dev="$1"
+  local state_file=""
+
+  while IFS= read -r state_file; do
+    [[ -n "$state_file" ]] || continue
+    rm -f "$state_file" 2>/dev/null || true
+  done < <(list_existing_offload_state_files_for_dev "$dev")
 }
 
 capture_offload_state_if_needed() {
   local dev="$1"
   local state_file="$2"
+  local candidate_state_file=""
   local tmp_file=""
   local tso=""
   local gso=""
   local gro=""
 
-  if [[ -r "$state_file" && -s "$state_file" ]]; then
-    tso="$(awk -F= '/^TSO=/{print $2; exit}' "$state_file" || true)"
-    gso="$(awk -F= '/^GSO=/{print $2; exit}' "$state_file" || true)"
-    gro="$(awk -F= '/^GRO=/{print $2; exit}' "$state_file" || true)"
+  while IFS= read -r candidate_state_file; do
+    [[ -n "$candidate_state_file" ]] || continue
+
+    tso="$(awk -F= '/^TSO=/{print $2; exit}' "$candidate_state_file" || true)"
+    gso="$(awk -F= '/^GSO=/{print $2; exit}' "$candidate_state_file" || true)"
+    gro="$(awk -F= '/^GRO=/{print $2; exit}' "$candidate_state_file" || true)"
     if [[ "$tso" =~ ^(on|off)$ && "$gso" =~ ^(on|off)$ && "$gro" =~ ^(on|off)$ ]]; then
+      if [[ "$candidate_state_file" != "$state_file" ]]; then
+        if mkdir -p "$OFFLOAD_STATE_DIR" 2>/dev/null; then
+          tmp_file="${state_file}.tmp.$$"
+          if printf 'TSO=%s\nGSO=%s\nGRO=%s\n' "$tso" "$gso" "$gro" >"$tmp_file" 2>/dev/null && \
+            mv -f "$tmp_file" "$state_file" 2>/dev/null; then
+            :
+          else
+            rm -f "$tmp_file" 2>/dev/null || true
+            echo "WARN: Failed to migrate offload state from '$candidate_state_file' to '$state_file'; keeping compatibility state file." >&2
+          fi
+        else
+          echo "WARN: Failed to create state directory '$OFFLOAD_STATE_DIR'; keeping compatibility offload state in '$candidate_state_file'." >&2
+        fi
+      fi
       return 0
     fi
-    echo "WARN: Existing offload state file '$state_file' is invalid; recapturing." >&2
-    rm -f "$state_file" 2>/dev/null || true
-  fi
+    echo "WARN: Existing offload state file '$candidate_state_file' is invalid; recapturing." >&2
+    rm -f "$candidate_state_file" 2>/dev/null || true
+  done < <(list_existing_offload_state_files_for_dev "$dev")
 
   tso="$(ethtool -k "$dev" 2>/dev/null | awk '/^[[:space:]]*tcp-segmentation-offload:/ {print $2; exit}' || true)"
   gso="$(ethtool -k "$dev" 2>/dev/null | awk '/^[[:space:]]*generic-segmentation-offload:/ {print $2; exit}' || true)"
@@ -923,51 +1585,69 @@ disable_offload_if_needed() {
 restore_offload_if_needed() {
   local dev="$1"
   local state_file=""
+  local first_state_file=""
   local tso=""
   local gso=""
   local gro=""
+  local saw_state=0
 
-  [[ "${DISABLE_OFFLOAD,,}" == "yes" ]] || return 0
+  first_state_file="$(list_existing_offload_state_files_for_dev "$dev" | awk 'NR==1 {print; exit}')"
+  [[ -n "$first_state_file" ]] || return 0
+
   if ! command -v ethtool >/dev/null 2>&1; then
     echo "WARN: ethtool not found; skipping offload restore on '$dev'." >&2
     return 0
   fi
 
-  state_file="$(offload_state_file "$dev")"
-  if [[ ! -r "$state_file" ]]; then
-    echo "INFO: Offload state file not found for '$dev'; skipping offload restore." >&2
+  while IFS= read -r state_file; do
+    [[ -n "$state_file" ]] || continue
+    saw_state=1
+
+    tso="$(awk -F= '/^TSO=/{print $2; exit}' "$state_file" || true)"
+    gso="$(awk -F= '/^GSO=/{print $2; exit}' "$state_file" || true)"
+    gro="$(awk -F= '/^GRO=/{print $2; exit}' "$state_file" || true)"
+
+    if [[ ! "$tso" =~ ^(on|off)$ || ! "$gso" =~ ^(on|off)$ || ! "$gro" =~ ^(on|off)$ ]]; then
+      echo "WARN: Invalid offload state in '$state_file'; skipping restore." >&2
+      rm -f "$state_file" 2>/dev/null || true
+      continue
+    fi
+
+    if ! ethtool -K "$dev" tso "$tso" gso "$gso" gro "$gro" >/dev/null 2>&1; then
+      echo "WARN: Failed to restore tso/gso/gro on '$dev'; NIC may remain CPU-heavy." >&2
+      return 1
+    fi
+
+    clear_all_offload_state_files_for_dev "$dev"
     return 0
-  fi
+  done < <(list_existing_offload_state_files_for_dev "$dev")
 
-  tso="$(awk -F= '/^TSO=/{print $2; exit}' "$state_file" || true)"
-  gso="$(awk -F= '/^GSO=/{print $2; exit}' "$state_file" || true)"
-  gro="$(awk -F= '/^GRO=/{print $2; exit}' "$state_file" || true)"
-
-  if [[ ! "$tso" =~ ^(on|off)$ || ! "$gso" =~ ^(on|off)$ || ! "$gro" =~ ^(on|off)$ ]]; then
-    echo "WARN: Invalid offload state in '$state_file'; skipping restore." >&2
-    rm -f "$state_file" 2>/dev/null || true
-    return 1
-  fi
-
-  if ! ethtool -K "$dev" tso "$tso" gso "$gso" gro "$gro" >/dev/null 2>&1; then
-    echo "WARN: Failed to restore tso/gso/gro on '$dev'; NIC may remain CPU-heavy." >&2
-    return 1
-  fi
-
-  rm -f "$state_file" 2>/dev/null || true
+  (( saw_state == 0 )) && return 0
+  echo "WARN: No valid offload state remained for '$dev'; NIC may remain CPU-heavy." >&2
+  return 1
 }
 
 has_root_cake_qdisc() {
   local dev="$1"
-  local qdisc_dump=""
-
-  qdisc_dump="$(tc qdisc show dev "$dev" 2>/dev/null || true)"
-  grep -qE '\bqdisc[[:space:]]+cake\b.*\broot\b' <<<"$qdisc_dump"
+  tc qdisc show dev "$dev" 2>/dev/null | awk '
+    $1 == "qdisc" && $2 == "cake" {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "root") {
+          found = 1
+          exit
+        }
+      }
+    }
+    END {
+      exit(found ? 0 : 1)
+    }
+  '
 }
 
 remove_wan_cake_root_if_owned() {
   local dev="$1"
   local owner=""
+  local compat_owner_state_file=""
   local default_kind=""
   local post_kind=""
 
@@ -986,8 +1666,17 @@ remove_wan_cake_root_if_owned() {
     echo "INFO: Root qdisc on '$dev' is not cake, skipping root qdisc delete." >&2
     if [[ "$owner" == "$dev" ]]; then
       clear_root_cake_state
+      [[ -n "$compat_owner_state_file" ]] && rm -f "$compat_owner_state_file" 2>/dev/null || true
     fi
     return 0
+  fi
+
+  if [[ -z "$owner" ]]; then
+    compat_owner_state_file="$(find_compat_root_cake_state_file_for_dev "$dev" "$ALLOW_ROOT_STATE_GLOBAL_SCAN" || true)"
+    if [[ -n "$compat_owner_state_file" ]]; then
+      owner="$dev"
+      echo "WARN: Root CAKE compatibility marker '$compat_owner_state_file' matches '$dev'; treating it as owned for cleanup." >&2
+    fi
   fi
 
   if [[ -z "$owner" ]]; then
@@ -1004,6 +1693,7 @@ remove_wan_cake_root_if_owned() {
       no)
         echo "ERROR: Root CAKE on '$dev' has no ownership marker; refusing to delete." >&2
         echo "ERROR: Set ALLOW_UNOWNED_WAN_CAKE_DELETE=yes to allow legacy/unowned cleanup." >&2
+        echo "ERROR: If OFFLOAD_STATE_DIR was changed, set OFFLOAD_STATE_COMPAT_DIRS to old state dir(s) for migration-safe cleanup." >&2
         return 1
         ;;
       *)
@@ -1018,7 +1708,17 @@ remove_wan_cake_root_if_owned() {
     return 1
   fi
 
-  post_kind="$(tc qdisc show dev "$dev" 2>/dev/null | awk '$4=="root" {print $2; exit}' || true)"
+  post_kind="$(tc qdisc show dev "$dev" 2>/dev/null | awk '
+    $1 == "qdisc" {
+      kind = $2
+      for (i = 1; i <= NF; i++) {
+        if ($i == "root") {
+          print kind
+          exit
+        }
+      }
+    }
+  ' || true)"
   if [[ "$post_kind" == "cake" ]]; then
     default_kind="$(kernel_default_qdisc_kind)"
     if [[ "$default_kind" != "cake" ]]; then
@@ -1029,6 +1729,7 @@ remove_wan_cake_root_if_owned() {
   fi
 
   clear_root_cake_state
+  [[ -n "$compat_owner_state_file" ]] && rm -f "$compat_owner_state_file" 2>/dev/null || true
 }
 
 rollback_new_wan_cake_root_if_needed() {
@@ -1073,7 +1774,17 @@ rollback_new_wan_cake_root_if_needed() {
     return 1
   fi
 
-  post_kind="$(tc qdisc show dev "$dev" 2>/dev/null | awk '$4=="root" {print $2; exit}' || true)"
+  post_kind="$(tc qdisc show dev "$dev" 2>/dev/null | awk '
+    $1 == "qdisc" {
+      kind = $2
+      for (i = 1; i <= NF; i++) {
+        if ($i == "root") {
+          print kind
+          exit
+        }
+      }
+    }
+  ' || true)"
   if [[ "$post_kind" == "cake" ]]; then
     default_kind="$(kernel_default_qdisc_kind)"
     if [[ "$default_kind" != "cake" ]]; then
@@ -1154,7 +1865,7 @@ ensure_ifb_device() {
     fi
     created_new=1
   fi
-  if ip -o link show dev "$ifb" 2>/dev/null | grep -qE '<[^>]*\bUP\b'; then
+  if ip -o link show dev "$ifb" 2>/dev/null | grep -qE '<([^>]*,)?UP(,|>)'; then
     was_up=1
   fi
   if ! ip link set "$ifb" up; then
@@ -1207,7 +1918,7 @@ setup_ingress_redirect() {
 
   # Ensure ingress/clsact exists before managing redirect filters.
   qdisc_dump="$(tc qdisc show dev "$wan" 2>/dev/null || true)"
-  if ! grep -qE '\b(ingress|clsact)\b' <<<"$qdisc_dump"; then
+  if ! grep -qE '^[[:space:]]*qdisc[[:space:]]+(ingress|clsact)([[:space:]]|$)' <<<"$qdisc_dump"; then
     if tc qdisc add dev "$wan" handle ffff: ingress 2>/dev/null; then
       created_qdisc_kind="ingress"
     elif tc qdisc add dev "$wan" clsact; then
@@ -1218,7 +1929,7 @@ setup_ingress_redirect() {
     fi
   fi
 
-  # Only clean filters owned by this script (matched by fixed pref).
+  # Clean script-managed filters at current pref, plus legacy prefs that still redirect to this IFB.
   if [[ -n "$created_qdisc_kind" ]]; then
     if ! save_ingress_qdisc_state "$wan"; then
       tc qdisc del dev "$wan" "$created_qdisc_kind" 2>/dev/null || true
@@ -1227,7 +1938,7 @@ setup_ingress_redirect() {
     fi
   fi
 
-  delete_ingress_redirect_filters "$wan"
+  delete_ingress_redirect_filters "$wan" "$ifb"
 
   add_ingress_redirect_filters "$wan" "$ifb"
 }
@@ -1244,8 +1955,8 @@ apply_ingress_via_ifb() {
 
   # Empty DOWN_BW means explicit ingress disable; clean residual state.
   if [[ -z "$DOWN_BW" ]]; then
-    delete_ingress_redirect_filters "$wan"
-    if has_script_ingress_redirect_filters "$wan"; then
+    delete_ingress_redirect_filters "$wan" "$ifb"
+    if has_script_ingress_redirect_filters "$wan" "$ifb"; then
       echo "ERROR: Ingress redirect filters on '$wan' remain after delete attempt." >&2
       return 1
     fi
@@ -1387,8 +2098,8 @@ start() {
     echo "ERROR: Failed to apply ingress shaping; attempting rollback." >&2
 
     # Best-effort rollback for partial start.
-    delete_ingress_redirect_filters "$WAN_IF"
-    if has_script_ingress_redirect_filters "$WAN_IF"; then
+    delete_ingress_redirect_filters "$WAN_IF" "$IFB_DEV"
+    if has_script_ingress_redirect_filters "$WAN_IF" "$IFB_DEV"; then
       echo "WARN: Ingress redirect filters on '$WAN_IF' remain after rollback delete attempt." >&2
       rollback_failed=1
     fi
@@ -1440,12 +2151,12 @@ stop() {
         stop_failed=1
         wan_cleanup_complete=0
       fi
-      delete_ingress_redirect_filters "$control_wan"
+      delete_ingress_redirect_filters "$control_wan" "$IFB_DEV"
       if ! remove_wan_ingress_qdisc_if_owned "$control_wan"; then
         stop_failed=1
         wan_cleanup_complete=0
       fi
-      if has_script_ingress_redirect_filters "$control_wan"; then
+      if has_script_ingress_redirect_filters "$control_wan" "$IFB_DEV"; then
         echo "WARN: Ingress redirect filters still exist on '$control_wan'; WAN cleanup is incomplete." >&2
         stop_failed=1
         wan_cleanup_complete=0
@@ -1523,17 +2234,53 @@ case "$CMD" in
     ;;
   restart)
     acquire_global_lock_or_exit
-    restart_target="$(resolve_control_wan_if "${WAN_IF-}" || true)"
-    if [[ -n "${restart_target-}" ]] && ! ip link show "$restart_target" >/dev/null 2>&1; then
-      echo "WARN: Resolved restart WAN_IF '$restart_target' does not exist; falling back to auto-detection." >&2
-      restart_target="$(detect_wan_if || true)"
+    restart_control_wan="$(resolve_control_wan_if "${WAN_IF-}" || true)"
+    if [[ -z "${restart_control_wan-}" ]]; then
+      echo "ERROR: Cannot determine restart control WAN_IF; aborting before stop." >&2
+      exit 1
+    fi
+    restart_control_exists=0
+    if ip link show "$restart_control_wan" >/dev/null 2>&1; then
+      restart_control_exists=1
+    fi
+    if (( restart_control_exists == 0 )) && [[ -n "${WAN_IF-}" ]]; then
+      echo "ERROR: Restart control WAN_IF '$restart_control_wan' does not exist; aborting before stop." >&2
+      exit 1
+    fi
+    restart_start_wan="${WAN_IF-}"
+    if [[ -z "${restart_start_wan-}" ]]; then
+      if (( restart_control_exists == 1 )); then
+        restart_start_wan="$restart_control_wan"
+      else
+        restart_start_wan="$(detect_wan_if || true)"
+      fi
+    fi
+    if [[ -z "${restart_start_wan-}" ]]; then
+      echo "ERROR: Cannot determine restart start WAN_IF; aborting before stop." >&2
+      exit 1
+    fi
+    if ! ip link show "$restart_start_wan" >/dev/null 2>&1; then
+      echo "ERROR: Restart start WAN_IF '$restart_start_wan' does not exist; aborting before stop." >&2
+      exit 1
     fi
     restart_stop_failed=0
     if ! stop; then
       restart_stop_failed=1
-      echo "WARN: stop failed during restart; proceeding with start." >&2
+      case "${RESTART_CONTINUE_ON_STOP_FAILURE,,}" in
+        yes)
+          echo "WARN: stop failed during restart; continuing because RESTART_CONTINUE_ON_STOP_FAILURE=yes." >&2
+          ;;
+        no)
+          echo "ERROR: stop failed during restart; aborting before start to avoid partial-cleanup restart." >&2
+          exit 2
+          ;;
+        *)
+          echo "ERROR: Invalid RESTART_CONTINUE_ON_STOP_FAILURE=$RESTART_CONTINUE_ON_STOP_FAILURE (use yes/no)." >&2
+          exit 1
+          ;;
+      esac
     fi
-    WAN_IF="${restart_target-}"
+    WAN_IF="${restart_start_wan-}"
     start
     (( restart_stop_failed == 0 )) || exit 2
     ;;
