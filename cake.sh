@@ -1069,6 +1069,17 @@ load_named_state_from_candidates() {
   return 1
 }
 
+clear_named_state_from_candidates() {
+  local state_name="$1"
+  local dir=""
+  local state_file=""
+
+  while IFS= read -r dir; do
+    state_file="${dir%/}/$state_name"
+    rm -f "$state_file" 2>/dev/null || true
+  done < <(state_dir_candidates)
+}
+
 migrate_named_state_to_primary_if_needed() {
   local source_file="$1"
   local target_file="$2"
@@ -1215,35 +1226,7 @@ resolve_control_wan_if() {
 }
 
 clear_wan_if_state() {
-  local entry=""
-  local state_file=""
-  local -a compat_dirs=()
-  local -A seen=()
-
-  entry="${OFFLOAD_STATE_DIR%/}"
-  if [[ -n "$entry" ]]; then
-    seen["$entry"]=1
-    rm -f "${entry}/wan-if.state" 2>/dev/null || true
-  fi
-
-  if [[ -n "${OFFLOAD_STATE_COMPAT_DIRS//[[:space:]]/}" ]]; then
-    IFS=':' read -r -a compat_dirs <<<"$OFFLOAD_STATE_COMPAT_DIRS"
-    for entry in "${compat_dirs[@]}"; do
-      entry="${entry%/}"
-      [[ -z "$entry" || -n "${seen[$entry]+x}" ]] && continue
-      seen["$entry"]=1
-      state_file="${entry}/wan-if.state"
-      rm -f "$state_file" 2>/dev/null || true
-    done
-  fi
-
-  for entry in "$OFFLOAD_STATE_LEGACY_DIR" "/run/qos-cake" "/var/run/qos-cake"; do
-    entry="${entry%/}"
-    [[ -z "$entry" || -n "${seen[$entry]+x}" ]] && continue
-    seen["$entry"]=1
-    state_file="${entry}/wan-if.state"
-    rm -f "$state_file" 2>/dev/null || true
-  done
+  clear_named_state_from_candidates "wan-if.state"
 }
 
 root_cake_state_file() {
@@ -1292,35 +1275,7 @@ load_root_cake_state() {
 }
 
 clear_root_cake_state() {
-  local entry=""
-  local state_file=""
-  local -a compat_dirs=()
-  local -A seen=()
-
-  entry="${OFFLOAD_STATE_DIR%/}"
-  if [[ -n "$entry" ]]; then
-    seen["$entry"]=1
-    rm -f "${entry}/root-cake.state" 2>/dev/null || true
-  fi
-
-  if [[ -n "${OFFLOAD_STATE_COMPAT_DIRS//[[:space:]]/}" ]]; then
-    IFS=':' read -r -a compat_dirs <<<"$OFFLOAD_STATE_COMPAT_DIRS"
-    for entry in "${compat_dirs[@]}"; do
-      entry="${entry%/}"
-      [[ -z "$entry" || -n "${seen[$entry]+x}" ]] && continue
-      seen["$entry"]=1
-      state_file="${entry}/root-cake.state"
-      rm -f "$state_file" 2>/dev/null || true
-    done
-  fi
-
-  for entry in "$OFFLOAD_STATE_LEGACY_DIR" "/run/qos-cake" "/var/run/qos-cake"; do
-    entry="${entry%/}"
-    [[ -z "$entry" || -n "${seen[$entry]+x}" ]] && continue
-    seen["$entry"]=1
-    state_file="${entry}/root-cake.state"
-    rm -f "$state_file" 2>/dev/null || true
-  done
+  clear_named_state_from_candidates "root-cake.state"
 }
 
 find_compat_root_cake_state_file_for_dev() {
