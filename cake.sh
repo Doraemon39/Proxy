@@ -28,6 +28,7 @@ DISABLE_OFFLOAD="${DISABLE_OFFLOAD:-yes}"  # yes/no; default yes, disable WAN ts
 DELETE_IFB_ON_STOP="${DELETE_IFB_ON_STOP:-no}"  # yes/no; delete IFB device on stop when yes.
 ALLOW_IFB_REUSE="${ALLOW_IFB_REUSE:-no}"        # yes/no; allow reusing non-owned IFB root qdisc.
 ALLOW_UNOWNED_WAN_CAKE_DELETE="${ALLOW_UNOWNED_WAN_CAKE_DELETE:-no}"  # yes/no; allow deleting unowned WAN root CAKE.
+ALLOW_NONDEFAULT_WAN_ROOT_REPLACE="${ALLOW_NONDEFAULT_WAN_ROOT_REPLACE:-no}"  # yes/no; allow replacing non-default non-CAKE WAN root qdisc (rollback can be lossy).
 RESTART_CONTINUE_ON_STOP_FAILURE="${RESTART_CONTINUE_ON_STOP_FAILURE:-no}"  # yes/no; continue restart start-phase if stop fails.
 INGRESS_PREF="${INGRESS_PREF:-49152}"           # Fixed pref used by this script's ingress filters.
 OFFLOAD_STATE_DIR="${OFFLOAD_STATE_DIR:-/run/qos-cake}"  # Directory for runtime state files.
@@ -459,6 +460,63 @@ kernel_default_qdisc_kind() {
 
   kind="${kind%%[[:space:]]*}"
   echo "$kind"
+}
+
+root_qdisc_kind_and_handle() {
+  local dev="$1"
+  local kind_and_handle=""
+
+  kind_and_handle="$(tc qdisc show dev "$dev" 2>/dev/null | awk '
+    $1 == "qdisc" {
+      kind = $2
+      handle = $3
+      for (i = 1; i <= NF; i++) {
+        if ($i == "root") {
+          print kind "|" handle
+          exit
+        }
+      }
+    }
+  ' || true)"
+  echo "$kind_and_handle"
+}
+
+validate_wan_root_replace_policy() {
+  local dev="$1"
+  local root_identity=""
+  local root_kind=""
+  local root_handle=""
+
+  root_identity="$(root_qdisc_kind_and_handle "$dev")"
+  [[ -n "$root_identity" ]] || return 0
+
+  IFS='|' read -r root_kind root_handle <<<"$root_identity"
+  [[ -n "$root_kind" ]] || return 0
+
+  # Existing root CAKE can be fully restored from signature.
+  [[ "$root_kind" == "cake" ]] && return 0
+
+  # Handle 0: and common built-in kinds are kernel/driver managed defaults,
+  # and can be restored by deleting script-installed root CAKE.
+  if [[ "$root_handle" == "0:" || "$root_kind" == "noqueue" || "$root_kind" == "mq" || "$root_kind" == "multiq" ]]; then
+    return 0
+  fi
+
+  case "${ALLOW_NONDEFAULT_WAN_ROOT_REPLACE,,}" in
+    yes)
+      echo "WARN: WAN '$dev' has non-default root qdisc '$root_kind' (handle '$root_handle'); continuing due to ALLOW_NONDEFAULT_WAN_ROOT_REPLACE=yes. Rollback can be lossy." >&2
+      return 0
+      ;;
+    no)
+      echo "ERROR: WAN '$dev' has non-default root qdisc '$root_kind' (handle '$root_handle'); refusing start to avoid lossy rollback." >&2
+      echo "ERROR: Set ALLOW_NONDEFAULT_WAN_ROOT_REPLACE=yes to force replacement." >&2
+      return 1
+      ;;
+    *)
+      echo "ERROR: Invalid ALLOW_NONDEFAULT_WAN_ROOT_REPLACE=$ALLOW_NONDEFAULT_WAN_ROOT_REPLACE (use yes/no)." >&2
+      return 1
+      ;;
+  esac
 }
 
 validate_ifb_reuse_policy() {
@@ -895,6 +953,7 @@ clear_ingress_qdisc_state() {
 
 remove_wan_ingress_qdisc_if_owned() {
   local dev="$1"
+  local ifb="${2-}"
   local qdisc_dump=""
   local filter_dump=""
   local ingress_dump=""
@@ -915,6 +974,11 @@ remove_wan_ingress_qdisc_if_owned() {
     return 0
   fi
 
+  if [[ -n "$ifb" ]] && has_script_ingress_redirect_filters "$dev" "$ifb"; then
+    echo "ERROR: Script-managed ingress redirect filters still exist on '$dev'; owned qdisc delete is incomplete." >&2
+    return 1
+  fi
+
   filter_dump="$(tc filter show dev "$dev" 2>/dev/null || true)"
   if [[ -z "${filter_dump//[[:space:]]/}" ]]; then
     filter_dump="$(tc filter show dev "$dev" parent ffff: 2>/dev/null || true)"
@@ -927,8 +991,9 @@ remove_wan_ingress_qdisc_if_owned() {
     fi
   fi
   if [[ -n "${filter_dump//[[:space:]]/}" ]]; then
-    echo "ERROR: Ingress/clsact qdisc on '$dev' still has filters; owned qdisc delete is incomplete." >&2
-    return 1
+    clear_ingress_qdisc_state
+    echo "WARN: Ingress/clsact qdisc on '$dev' still has non-script filters; leaving qdisc in place and clearing ownership marker." >&2
+    return 0
   fi
 
   if grep -qE '^[[:space:]]*qdisc[[:space:]]+clsact([[:space:]]|$)' <<<"$qdisc_dump"; then
@@ -939,6 +1004,24 @@ remove_wan_ingress_qdisc_if_owned() {
 
   qdisc_dump="$(tc qdisc show dev "$dev" 2>/dev/null || true)"
   if grep -qE '^[[:space:]]*qdisc[[:space:]]+(ingress|clsact)([[:space:]]|$)' <<<"$qdisc_dump"; then
+    if [[ -n "$ifb" ]] && ! has_script_ingress_redirect_filters "$dev" "$ifb"; then
+      filter_dump="$(tc filter show dev "$dev" 2>/dev/null || true)"
+      if [[ -z "${filter_dump//[[:space:]]/}" ]]; then
+        filter_dump="$(tc filter show dev "$dev" parent ffff: 2>/dev/null || true)"
+      fi
+      if [[ -z "${filter_dump//[[:space:]]/}" ]]; then
+        ingress_dump="$(tc filter show dev "$dev" ingress 2>/dev/null || true)"
+        egress_dump="$(tc filter show dev "$dev" egress 2>/dev/null || true)"
+        if [[ -n "${ingress_dump//[[:space:]]/}" || -n "${egress_dump//[[:space:]]/}" ]]; then
+          filter_dump="filters-present"
+        fi
+      fi
+      if [[ -n "${filter_dump//[[:space:]]/}" ]]; then
+        clear_ingress_qdisc_state
+        echo "WARN: Ingress/clsact qdisc on '$dev' became shared during delete; leaving qdisc in place and clearing ownership marker." >&2
+        return 0
+      fi
+    fi
     echo "ERROR: Failed to remove owned ingress/clsact qdisc on '$dev'." >&2
     return 1
   fi
@@ -1922,7 +2005,7 @@ apply_ingress_via_ifb() {
       echo "ERROR: Ingress redirect filters on '$wan' remain after delete attempt." >&2
       return 1
     fi
-    remove_wan_ingress_qdisc_if_owned "$wan" || return 1
+    remove_wan_ingress_qdisc_if_owned "$wan" "$ifb" || return 1
     if should_skip_unowned_ifb_cleanup "$ifb"; then
       echo "INFO: IFB '$ifb' root cake is unmarked; leaving it untouched because ingress shaping is disabled." >&2
       return 0
@@ -2008,6 +2091,10 @@ start() {
     clear_root_cake_state
   fi
 
+  if ! validate_wan_root_replace_policy "$WAN_IF"; then
+    exit 1
+  fi
+
   if ! save_wan_if_state "$WAN_IF"; then
     echo "ERROR: Failed to persist WAN_IF state; aborting to avoid cleanup targeting the wrong interface later." >&2
     exit 1
@@ -2065,7 +2152,7 @@ start() {
       echo "WARN: Ingress redirect filters on '$WAN_IF' remain after rollback delete attempt." >&2
       rollback_failed=1
     fi
-    remove_wan_ingress_qdisc_if_owned "$WAN_IF" || rollback_failed=1
+    remove_wan_ingress_qdisc_if_owned "$WAN_IF" "$IFB_DEV" || rollback_failed=1
     if should_skip_unowned_ifb_cleanup "$IFB_DEV"; then
       echo "INFO: IFB '$IFB_DEV' root cake is unmarked; skipping IFB rollback cleanup." >&2
     else
@@ -2114,7 +2201,7 @@ stop() {
         wan_cleanup_complete=0
       fi
       delete_ingress_redirect_filters "$control_wan" "$IFB_DEV"
-      if ! remove_wan_ingress_qdisc_if_owned "$control_wan"; then
+      if ! remove_wan_ingress_qdisc_if_owned "$control_wan" "$IFB_DEV"; then
         stop_failed=1
         wan_cleanup_complete=0
       fi
